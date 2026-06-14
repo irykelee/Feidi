@@ -975,6 +975,11 @@ PC_HTML = r"""<!DOCTYPE html>
   evtSource.addEventListener("device_list", function(e) {
     var data = JSON.parse(e.data);
     renderDeviceList(data.devices || []);
+    // 默认私聊模式：自动选中第一台非本机设备
+    if (!selectedDevice) {
+      var others = (data.devices || []).filter(function(d) { return d.id !== MY_ID; });
+      if (others.length > 0) switchConversation(others[0].id);
+    }
   });
   evtSource.onopen = function() {
     fetch("/status").then(function(r) { return r.json(); }).then(function(d) {
@@ -1234,12 +1239,46 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   .empty-state{flex:1;display:flex;align-items:center;justify-content:center;color:var(--c-text3);font-size:15px;flex-direction:column;gap:8px}
   .toast{position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,.85);color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;z-index:100;opacity:0;transition:opacity .3s}
   .toast.show{opacity:1}
+  /* 聊天标题栏 */
+  .chat-title-bar{display:none;align-items:center;justify-content:center;gap:6px;padding:8px 14px;background:var(--c-surface);border-bottom:1px solid var(--c-border);font-size:13px;font-weight:500;color:var(--c-text);position:sticky;top:42px;z-index:9}
+  .chat-title-bar.show{display:flex}
+  .chat-title-bar .ct-dot{width:6px;height:6px;border-radius:50%;background:#10b981;flex-shrink:0}
+  /* 设备按钮 */
+  .header .devices-btn{position:absolute;left:10px;display:flex;align-items:center;gap:2px;background:rgba(255,255,255,.15);color:#fff;border:none;border-radius:14px;padding:3px 8px 3px 5px;font-size:12px;cursor:pointer}
+  .header .devices-btn .db-count{background:rgba(255,255,255,.25);border-radius:10px;padding:0 5px;font-size:10px;min-width:18px;text-align:center;line-height:16px}
+  /* 设备侧边栏（从右滑出）*/
+  .sidebar-backdrop{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.35);z-index:100;display:none;transition:opacity .2s}
+  .sidebar-backdrop.show{display:block}
+  .sidebar{position:fixed;top:0;right:-280px;width:260px;height:100%;height:100dvh;background:var(--c-surface);z-index:110;transition:transform .25s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;box-shadow:-2px 0 16px rgba(0,0,0,.1);overflow:hidden}
+  .sidebar.show{transform:translateX(-280px)}
+  .sidebar .sb-header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--c-border);flex-shrink:0}
+  .sidebar .sb-header .sb-title{font-size:15px;font-weight:600;color:var(--c-text);display:flex;align-items:center;gap:6px}
+  .sidebar .sb-header .sb-close{width:28px;height:28px;border:none;background:var(--c-border);color:var(--c-text2);border-radius:50%;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+  .sidebar .sb-body{flex:1;overflow-y:auto;padding:8px}
+  .sidebar .sb-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;cursor:pointer;transition:background .15s;margin-bottom:4px}
+  .sidebar .sb-item:active,.sidebar .sb-item.selected{background:var(--c-primary-light)}
+  .sidebar .sb-item.me{opacity:.7}
+  .sidebar .sb-item .sb-avatar{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:600;color:#fff;flex-shrink:0}
+  .sidebar .sb-item .sb-info{flex:1;min-width:0}
+  .sidebar .sb-item .sb-name{font-size:14px;font-weight:500;color:var(--c-text);display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+  .sidebar .sb-item .sb-type{font-size:11px;color:var(--c-text3);margin-top:1px}
+  .sidebar .sb-item .sb-badge{font-size:9px;padding:1px 5px;border-radius:8px;font-weight:500}
+  .sidebar .sb-item .sb-badge.me-badge{background:var(--c-pri);color:#fff}
+  .sidebar .sb-item .sb-badge.remark-badge{background:#f59e0b;color:#fff}
+  /* 设备操作菜单 */
+  .sidebar .sb-item-menu{display:flex;gap:4px;flex-shrink:0}
+  .sidebar .sb-item-menu button{width:24px;height:24px;border:none;background:var(--c-border);color:var(--c-text2);border-radius:6px;cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center}
+  /* 侧边栏内输入框（改名） */
+  .sidebar .sb-rename-input{width:100%;border:1px solid var(--c-pri);border-radius:6px;padding:3px 6px;font-size:13px;outline:none;font-family:inherit;background:var(--c-input-bg);color:var(--c-text)}
 </style>
 </head>
 <body>
-<div class="header">飞递 Feidi<button class="theme-btn" id="themeBtn" onclick="toggleTheme()">__ICON_MOON__</button><div class="sub">手机端</div></div>
+<div class="header">飞递 Feidi<button class="devices-btn" id="devicesBtn" onclick="toggleSidebar()"><span style="font-size:13px">&#x1F4F1;</span><span class="db-count" id="deviceCountBadge">0</span></button><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">__ICON_MOON__</button><div class="sub">手机端</div></div>
 <div class="status-bar connected" id="statusBar">
   <span class="dot green"></span><span>已连接</span>
+</div>
+<div class="chat-title-bar" id="chatTitleBar">
+  <span class="ct-dot"></span><span id="chatTitleText">飞递 Feidi</span>
 </div>
 <div class="messages" id="messages">
     <div class="empty-state" id="emptyState">
@@ -1266,6 +1305,15 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   <div class="menu-item" onclick="pickFile('other')"><span class="mi-icon other">__ICON_FILE__</span>其他文件</div>
 </div>
 <div class="toast" id="toast"></div>
+<!-- 设备侧边栏 -->
+<div class="sidebar-backdrop" id="sidebarBackdrop" onclick="toggleSidebar()"></div>
+<div class="sidebar" id="sidebar">
+  <div class="sb-header">
+    <span class="sb-title">&#x1F4F1; 在线设备</span>
+    <button class="sb-close" onclick="toggleSidebar()">✕</button>
+  </div>
+  <div class="sb-body" id="sbBody"></div>
+</div>
 <div class="login-overlay" id="loginOverlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:200;display:none;align-items:center;justify-content:center">
   <div style="background:#fff;border-radius:16px;padding:24px;width:280px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.2)">
     <div style="font-size:16px;font-weight:600;color:#2e7d32;margin-bottom:16px">飞递 Feidi</div>
@@ -1308,20 +1356,84 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   }
   var MY_DISPLAY_NAME = "";
   try { MY_DISPLAY_NAME = localStorage.getItem("feidi_myname") || ""; } catch(e) {}
+  var remarks = {};
+  try { remarks = JSON.parse(localStorage.getItem("feidi_remarks") || "{}"); } catch(e) {}
+  var MY_ID = "";
+  var MY_NAME = "手机";
+  var selectedDevice = null;
+  var sse_clients_cache = [];
+  var allMessages = [];
+
+  function getDisplayName(device) {
+    if (remarks[device.id]) return remarks[device.id];
+    return device.name || device.type;
+  }
+  function saveRemarks() {
+    try { localStorage.setItem("feidi_remarks", JSON.stringify(remarks)); } catch(e) {}
+  }
+  function saveMyName(name) {
+    MY_DISPLAY_NAME = name;
+    try { localStorage.setItem("feidi_myname", name); } catch(e) {}
+  }
+  function getAvatarColor(name) {
+    var hash = 0;
+    for (var i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    var h = ((hash % 360) + 360) % 360;
+    return "hsl(" + h + ", 55%, 48%)";
+  }
+  function getAvatarLetter(name) { return (name || "?")[0].toUpperCase(); }
+  function escHtml(s) {
+    var d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
+  }
+  function formatSize(bytes) {
+    if (!bytes || bytes < 0) return "0 B";
+    var units = ["B", "KB", "MB", "GB"];
+    var i = 0;
+    var s = bytes;
+    while (s >= 1024 && i < units.length - 1) { s /= 1024; i++; }
+    return (i === 0 ? s : s.toFixed(1)) + " " + units[i];
+  }
 
   const seenMsgs = new Set();
   const evtSource = new EventSource("/events?type=mobile&pid=" + encodeURIComponent(PERSISTENT_ID) + "&name=" + encodeURIComponent("手机") + (MY_DISPLAY_NAME ? "&my_name=" + encodeURIComponent(MY_DISPLAY_NAME) : ""));
+  
+  evtSource.addEventListener("device_id", function(e) {
+    var data = JSON.parse(e.data);
+    MY_ID = data.device_id;
+    MY_NAME = data.name;
+    if (MY_DISPLAY_NAME && MY_DISPLAY_NAME !== data.name) {
+      fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(MY_DISPLAY_NAME));
+    }
+  });
+
   evtSource.addEventListener("history", function(e) {
     const msgs = JSON.parse(e.data);
     msgs.forEach(function(m) {
-      if (!seenMsgs.has(m.id)) { seenMsgs.add(m.id); appendMessage(m, false); }
+      if (!seenMsgs.has(m.id)) { seenMsgs.add(m.id); allMessages.push(m); appendMessage(m, false); }
     });
   });
   evtSource.addEventListener("new_message", function(e) {
     const msg = JSON.parse(e.data);
     if (seenMsgs.has(msg.id)) return;
     seenMsgs.add(msg.id);
+    if (seenMsgs.size > 500) { seenMsgs.clear(); }
+    allMessages.push(msg);
+    if (selectedDevice) {
+      var fromSelected = msg.device_id === selectedDevice;
+      var toSelected = msg.target_id === selectedDevice;
+      if (!fromSelected && !((msg.device_id === MY_ID) && toSelected)) return;
+    }
     appendMessage(msg, true);
+  });
+  evtSource.addEventListener("device_list", function(e) {
+    var data = JSON.parse(e.data);
+    renderSidebar(data.devices || []);
+    if (!selectedDevice) {
+      var others = (data.devices || []).filter(function(d) { return d.id !== MY_ID; });
+      if (others.length > 0) switchConversation(others[0].id);
+    }
   });
 
   evtSource.onopen = function() {
@@ -1355,12 +1467,154 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   const loginOverlay = document.getElementById("loginOverlay");
   const passwordInput = document.getElementById("passwordInput");
   const loginError = document.getElementById("loginError");
+  const sidebar = document.getElementById("sidebar");
+  const sidebarBackdrop = document.getElementById("sidebarBackdrop");
+  const sbBody = document.getElementById("sbBody");
+  const deviceCountBadge = document.getElementById("deviceCountBadge");
+  const chatTitleBar = document.getElementById("chatTitleBar");
+  const chatTitleText = document.getElementById("chatTitleText");
 
   function showToast(msg) {
     toast.textContent = msg;
     toast.className = "toast show";
     setTimeout(function() { toast.className = "toast"; }, 2000);
   }
+
+  // --- 侧边栏 ---
+  window.toggleSidebar = function() {
+    var show = !sidebar.classList.contains("show");
+    sidebar.classList.toggle("show", show);
+    sidebarBackdrop.classList.toggle("show", show);
+  };
+
+  function updateChatTitleBar() {
+    if (selectedDevice) {
+      var name = selectedDevice;
+      for (var i = 0; i < (sse_clients_cache || []).length; i++) {
+        if (sse_clients_cache[i].id === selectedDevice) { name = getDisplayName(sse_clients_cache[i]); break; }
+      }
+      chatTitleText.textContent = name;
+      chatTitleBar.classList.add("show");
+    } else {
+      chatTitleBar.classList.remove("show");
+    }
+  }
+
+  function switchConversation(deviceId) {
+    if (deviceId === selectedDevice) return;
+    selectedDevice = deviceId;
+    updateChatTitleBar();
+    // 高亮侧边栏
+    var items = sbBody.querySelectorAll(".sb-item");
+    items.forEach(function(el) { el.classList.remove("selected"); });
+    if (deviceId) {
+      var sel = sbBody.querySelector('[data-device-id="' + deviceId + '"]');
+      if (sel) sel.classList.add("selected");
+    }
+    rebuildMessages();
+  }
+
+  function rebuildMessages() {
+    var list = msgContainer.querySelectorAll(".msg");
+    list.forEach(function(el) { el.remove(); });
+    if (emptyState && emptyState.parentNode) emptyState.parentNode.removeChild(emptyState);
+    allMessages.forEach(function(m) {
+      if (selectedDevice) {
+        var fromSelected = m.device_id === selectedDevice;
+        var toSelected = m.target_id === selectedDevice;
+        if (!fromSelected && !((m.device_id === MY_ID) && toSelected)) return;
+      }
+      appendMessage(m, false);
+    });
+    if (!msgContainer.querySelector(".msg")) {
+      if (emptyState) msgContainer.appendChild(emptyState);
+    }
+  }
+
+  function renderSidebar(devices) {
+    sse_clients_cache = devices;
+    var count = devices.length;
+    var otherCount = 0;
+    devices.forEach(function(d) { if (d.id !== MY_ID) otherCount++; });
+    deviceCountBadge.textContent = otherCount;
+    if (count === 0) return;
+    // 如果选中设备已断开，回到广播，并自动选第一台
+    if (selectedDevice) {
+      var stillHere = false;
+      devices.forEach(function(d) { if (d.id === selectedDevice) stillHere = true; });
+      if (!stillHere) {
+        selectedDevice = null;
+        updateChatTitleBar();
+        var others2 = devices.filter(function(d) { return d.id !== MY_ID; });
+        if (others2.length > 0) switchConversation(others2[0].id);
+        else rebuildMessages();
+      }
+    }
+    var html = "";
+    devices.forEach(function(d) {
+      var isMe = d.id === MY_ID;
+      var displayName = getDisplayName(d);
+      var isRemark = !!remarks[d.id];
+      var avatarColor = getAvatarColor(displayName);
+      var avatarLetter = getAvatarLetter(displayName);
+      var selCls = (d.id === selectedDevice) ? " selected" : "";
+      var meCls = isMe ? " me" : "";
+      var remarkTag = isRemark ? ' <span class="sb-badge remark-badge">备注</span>' : '';
+      var meTag = isMe ? ' <span class="sb-badge me-badge">本机</span>' : '';
+      html += '<div class="sb-item' + selCls + meCls + '" data-device-id="' + d.id + '">' +
+        '<div class="sb-avatar" style="background:' + avatarColor + '">' + avatarLetter + '</div>' +
+        '<div class="sb-info"><div class="sb-name">' + escHtml(displayName) + meTag + remarkTag + '</div>' +
+        '<div class="sb-type">' + (d.type === "mobile" ? "手机" : "电脑") + (isRemark ? ' — ' + escHtml(d.name || d.type) : '') + '</div></div>' +
+        '<div class="sb-item-menu"><button onclick="event.stopPropagation();startRenameMobile(\'' + d.id + '\')" title="' + (isMe ? '改名' : '备注') + '">✎</button></div>' +
+        '</div>';
+    });
+    sbBody.innerHTML = html;
+    sbBody.querySelectorAll(".sb-item").forEach(function(el) {
+      el.addEventListener("click", function() {
+        var did = el.getAttribute("data-device-id");
+        if (did === MY_ID) return;
+        toggleSidebar();
+        switchConversation(did === selectedDevice ? null : did);
+      });
+    });
+  }
+
+  window.startRenameMobile = function(deviceId) {
+    var item = sbBody.querySelector('[data-device-id="' + deviceId + '"]');
+    if (!item) return;
+    var nameEl = item.querySelector(".sb-name");
+    if (!nameEl) return;
+    var isMe = deviceId === MY_ID;
+    var oldName = isMe ? (MY_DISPLAY_NAME || MY_NAME) : (remarks[deviceId] || "");
+    var placeholder = isMe ? "给自己起个名字" : "添加备注（仅自己可见）";
+    var input = document.createElement("input");
+    input.className = "sb-rename-input";
+    input.value = oldName;
+    input.placeholder = placeholder;
+    input.setAttribute("data-device-id", deviceId);
+    input.addEventListener("blur", function() {
+      var v = input.value.trim();
+      if (isMe) {
+        saveMyName(v);
+        if (v && v !== MY_NAME) {
+          fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(v));
+        }
+      } else {
+        if (v) { remarks[deviceId] = v; } else { delete remarks[deviceId]; }
+        saveRemarks();
+      }
+      renderSidebar(sse_clients_cache);
+      updateChatTitleBar();
+    });
+    input.addEventListener("keydown", function(e) {
+      if (e.key === "Enter") { input.blur(); }
+      if (e.key === "Escape") { input.value = oldName; input.blur(); }
+    });
+    nameEl.style.display = "none";
+    nameEl.parentNode.insertBefore(input, nameEl);
+    input.focus();
+    input.select();
+  };
 
   window.doLogin = function() {
     const pw = passwordInput.value.trim();
@@ -1391,6 +1645,20 @@ MOBILE_HTML = r"""<!DOCTYPE html>
       img.src = msg.data;
       img.onclick = function() { window.open(msg.data); };
       div.appendChild(img);
+    } else if (msg.type === "file" && msg.data) {
+      var fd = msg.data;
+      var card = document.createElement("div");
+      card.style.cssText = "display:flex;align-items:center;gap:8px;padding:8px;background:rgba(255,255,255,.4);border-radius:8px;cursor:pointer";
+      card.onclick = function() { window.open(fd.path); };
+      var ficon = document.createElement("div");
+      ficon.style.cssText = "width:32px;height:32px;background:rgba(0,0,0,.08);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:14px";
+      ficon.textContent = "\uD83D\uDCC4";
+      card.appendChild(ficon);
+      var finfo = document.createElement("div");
+      finfo.style.cssText = "min-width:0";
+      finfo.innerHTML = '<div style="font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(fd.name || "文件") + '</div><div style="font-size:10px;opacity:.5">' + formatSize(fd.size) + '</div>';
+      card.appendChild(finfo);
+      div.appendChild(card);
     }
     const meta = document.createElement("div");
     meta.className = "meta";
@@ -1406,7 +1674,14 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text: text, sender: SENDER})
+      body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
+    }).then(function(r) { return r.json(); }).then(function(data) {
+      if (!data.ok) throw new Error("发送失败");
+      var localMsg = {id: data.msg_id, type: "text", data: text, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
+      seenMsgs.add(localMsg.id);
+      appendMessage(localMsg, true);
+    }).catch(function() {
+      showToast("发送失败");
     });
     textInput.value = "";
   };
@@ -1436,9 +1711,15 @@ MOBILE_HTML = r"""<!DOCTYPE html>
           fetch("/send", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({image: reader.result, sender: SENDER})
-          }).then(function(r) {
-            if (!r.ok) showToast("图片过大，请压缩后重试");
+            body: JSON.stringify({image: reader.result, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
+          }).then(function(r) { return r.json(); }).then(function(data) {
+            if (!data.ok) throw new Error("发送失败");
+            var path = "/img/" + data.msg_id;
+            var localMsg = {id: data.msg_id, type: "image", data: path, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
+            seenMsgs.add(localMsg.id);
+            appendMessage(localMsg, true);
+          }).catch(function() {
+            showToast("图片过大，请压缩后重试");
           });
         };
         reader.readAsDataURL(file);
@@ -1459,9 +1740,15 @@ MOBILE_HTML = r"""<!DOCTYPE html>
             fetch("/send", {
               method: "POST",
               headers: {"Content-Type": "application/json"},
-              body: JSON.stringify({file: fileInfo, sender: SENDER})
-            }).then(function(r) {
-              if (!r.ok) showToast("文件过大，请压缩后重试");
+              body: JSON.stringify({file: fileInfo, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
+            }).then(function(r) { return r.json(); }).then(function(data) {
+              if (!data.ok) throw new Error("发送失败");
+              var localMsg = {id: data.msg_id, type: "file", data: {name: file.name, size: file.size, path: "/file/" + data.msg_id}, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
+              seenMsgs.add(localMsg.id);
+              appendMessage(localMsg, true);
+              showToast("文件已发送");
+            }).catch(function() {
+              showToast("文件过大或发送失败");
             });
           };
           reader.readAsDataURL(file);
