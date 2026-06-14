@@ -17,6 +17,7 @@ import queue
 import secrets
 import shutil
 import re
+import subprocess
 import atexit
 import signal
 import threading
@@ -27,21 +28,357 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
-# 内置 qrcode 库路径（vendored，无需 pip install）
-if getattr(sys, 'frozen', False):
-    # PyInstaller 打包后，资源文件在 _MEIPASS 临时目录
-    _script_dir = sys._MEIPASS
-else:
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
-_qrcode_path = os.path.join(_script_dir, 'qrcode_lib')
-if os.path.isdir(_qrcode_path):
-    sys.path.insert(0, _qrcode_path)
-    try:
-        import qrcode as _qrcode
-    except ImportError:
-        _qrcode = None
-else:
-    _qrcode = None
+# --- 纯 Python QR 码生成器（零外部依赖） ---
+
+# GF(256) 运算表（Reed-Solomon 纠错编码用）
+_GF_EXP = [0] * 512
+_GF_LOG = [0] * 256
+_x = 1
+for _i in range(255):
+    _GF_EXP[_i] = _x
+    _GF_LOG[_x] = _i
+    _x <<= 1
+    if _x & 0x100:
+        _x ^= 0x11D
+for _i in range(255, 512):
+    _GF_EXP[_i] = _GF_EXP[_i - 255]
+
+def _gf_mul(a, b):
+    if a == 0 or b == 0:
+        return 0
+    return _GF_EXP[_GF_LOG[a] + _GF_LOG[b]]
+
+def _gf_poly_mul(p, q):
+    r = [0] * (len(p) + len(q) - 1)
+    for i, pi in enumerate(p):
+        for j, qj in enumerate(q):
+            r[i + j] ^= _gf_mul(pi, qj)
+    return r
+
+def _rs_generator(nsym):
+    g = [1]
+    for i in range(nsym):
+        g = _gf_poly_mul(g, [1, _GF_EXP[i]])
+    return g
+
+def _rs_encode(msg_in, nsym):
+    """Reed-Solomon 编码，返回 nsym 个纠错码字"""
+    gen = _rs_generator(nsym)
+    msg = msg_in + [0] * nsym
+    for i in range(len(msg_in)):
+        coef = msg[i]
+        if coef != 0:
+            for j in range(len(gen)):
+                msg[i + j] ^= _gf_mul(gen[j], coef)
+    return msg[-nsym:]
+
+# 字母数字编码表
+_ALPHANUMERIC = {}
+for _i, _ch in enumerate("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"):
+    _ALPHANUMERIC[_ch] = _i
+
+# 各版本 / EC 级别对应的数据码字容量（EC 级别 L/M/Q/H → 版本 1-10）
+_CAPACITY = {
+    # L:   [v1,v2,v3,v4, v5, v6, v7, v8, v9,v10]
+    "L": [19,34,55,80,108,136,156,194,232,274],
+    "M": [16,28,44,64, 86,108,124,154,182,216],
+    "Q": [13,22,34,48, 62, 76, 88,110,132,154],
+    "H": [ 9,16,26,36, 46, 60, 66, 86,100,122],
+}
+# 各版本的纠错块结构 (EC 码字数, 每块数据码字数, 块数)
+_EC_BLOCKS = {
+    # v1
+    "L": [(7, 19, 1)], "M": [(10, 16, 1)], "Q": [(13, 13, 1)], "H": [(17, 9, 1)],
+    # v2
+    2: {"L": [(10, 34, 1)], "M": [(16, 28, 1)], "Q": [(22, 22, 1)], "H": [(28, 16, 1)]},
+    # v3
+    3: {"L": [(15, 55, 1)], "M": [(26, 44, 1)], "Q": [(18, 17, 2)], "H": [(22, 13, 2)]},
+    # v4
+    4: {"L": [(20, 80, 1)], "M": [(18, 32, 2)], "Q": [(26, 24, 2)], "H": [(16, 9, 4)]},
+    # v5
+    5: {"L": [(26, 108, 1)], "M": [(24, 43, 2)], "Q": [(18, 15, 2), (18, 16, 2)], "H": [(22, 11, 2), (22, 12, 2)]},
+    # v6
+    6: {"L": [(18, 68, 2)], "M": [(16, 27, 4)], "Q": [(24, 19, 4)], "H": [(28, 15, 4)]},
+    # v7
+    7: {"L": [(20, 78, 2)], "M": [(18, 31, 4)], "Q": [(18, 14, 2), (18, 15, 4)], "H": [(26, 13, 4), (26, 14, 1)]},
+    # v8
+    8: {"L": [(24, 97, 2)], "M": [(22, 38, 2), (22, 39, 2)], "Q": [(22, 18, 4), (22, 19, 2)], "H": [(26, 14, 4), (26, 15, 2)]},
+    # v9
+    9: {"L": [(30, 116, 2)], "M": [(22, 36, 3), (22, 37, 2)], "Q": [(20, 16, 4), (20, 17, 4)], "H": [(24, 12, 4), (24, 13, 4)]},
+    # v10
+    10: {"L": [(18, 68, 2), (18, 69, 2)], "M": [(26, 43, 4), (26, 44, 1)], "Q": [(24, 19, 6), (24, 20, 2)], "H": [(28, 15, 6), (28, 16, 2)]},
+}
+# 对齐图案位置（版本 2-10）
+_ALIGNMENT = {
+    2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
+    6: [6, 34], 7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50],
+}
+# 格式信息（EC_M_Q 的 8 种组合 × 8 个 mask）
+_FORMAT_INFO = [
+    0x5412,0x5125,0x5E7C,0x5B4B,0x45F9,0x40CE,0x4F97,0x4AA0,
+    0x77C4,0x72F3,0x7DAA,0x789D,0x662F,0x6318,0x6C41,0x6976,
+    0x1689,0x13BE,0x1CE7,0x19D0,0x0762,0x0255,0x0D0C,0x083B,
+    0x355F,0x3068,0x3F31,0x3A06,0x24B4,0x2183,0x2EDA,0x2BED,
+]
+_EC_LEVELS = {"L": 0, "M": 1, "Q": 2, "H": 3}
+
+
+def _generate_qr_modules(data_str, ec="M"):
+    """生成 QR 码的 2D 模块矩阵（True=黑, False=白）。返回 (modules, version)"""
+    # 1. 选版本
+    data_len = len(data_str)
+    version = None
+    for v in range(1, 11):
+        cap = _CAPACITY[ec][v - 1]
+        vdata = v
+        # 估算比特数：字母数字模式 4位模式指示 + 字符计数 + 每个字符对11位
+        ch_count_bits = 9 if v <= 9 else 11
+        total_bits = 4 + ch_count_bits + (data_len // 2) * 11 + (data_len % 2) * 6
+        total_bytes = (total_bits + 7) // 8
+        if total_bytes <= cap:
+            version = vdata
+            break
+    if version is None:
+        version = 10  # 最大版本兜底
+
+    # 2. 编码数据
+    bits = []
+    # 模式指示符：0010（字母数字）
+    bits.extend([0, 0, 1, 0])
+    # 字符计数
+    count_bits = 9 if version <= 9 else 11
+    for i in range(count_bits - 1, -1, -1):
+        bits.append((data_len >> i) & 1)
+    # 字符编码（成对）
+    chars = list(data_str)
+    i = 0
+    while i < len(chars):
+        if i + 1 < len(chars):
+            v = _ALPHANUMERIC.get(chars[i].upper(), 0) * 45 + _ALPHANUMERIC.get(chars[i + 1].upper(), 0)
+            for j in range(10, -1, -1):
+                bits.append((v >> j) & 1)
+            i += 2
+        else:
+            v = _ALPHANUMERIC.get(chars[i].upper(), 0)
+            for j in range(5, -1, -1):
+                bits.append((v >> j) & 1)
+            i += 1
+    # 终止符（最多 4 个 0）
+    total_codewords = _CAPACITY[ec][version - 1]
+    needed_bits = total_codewords * 8
+    term_len = min(4, needed_bits - len(bits))
+    bits.extend([0] * term_len)
+    # 补 0 到字节边界
+    while len(bits) % 8 != 0:
+        bits.append(0)
+    # 填充字节
+    pad_bytes = [0xEC, 0x11]
+    pi = 0
+    while len(bits) < needed_bits:
+        pb = pad_bytes[pi % 2]
+        for j in range(7, -1, -1):
+            bits.append((pb >> j) & 1)
+        pi += 1
+    # 截断到所需长度
+    bits = bits[:needed_bits]
+
+    # 3. 字节分组和纠错编码
+    data_bytes = []
+    for bi in range(0, len(bits), 8):
+        byte = 0
+        for j in range(8):
+            if bi + j < len(bits):
+                byte = (byte << 1) | bits[bi + j]
+        data_bytes.append(byte)
+
+    blocks_spec = _EC_BLOCKS.get(version, _EC_BLOCKS)[ec]
+    all_blocks = []
+    ec_blocks = []
+    ptr = 0
+    for nsym, ndata, nblocks in blocks_spec:
+        for _ in range(nblocks):
+            block_data = data_bytes[ptr:ptr + ndata]
+            ptr += ndata
+            all_blocks.append(block_data)
+            ec_blocks.append(_rs_encode(block_data, nsym))
+
+    # 交织排列
+    final = []
+    max_data = max(len(b) for b in all_blocks)
+    for i in range(max_data):
+        for b in all_blocks:
+            if i < len(b):
+                final.append(b[i])
+    max_ec = max(len(e) for e in ec_blocks)
+    for i in range(max_ec):
+        for e in ec_blocks:
+            if i < len(e):
+                final.append(e[i])
+
+    # 4. 构建矩阵
+    size = 17 + version * 4
+    matrix = [[None] * size for _ in range(size)]
+
+    # 放置定位图案（3 个角）
+    for (r, c) in [(0, 0), (0, size - 7), (size - 7, 0)]:
+        for i in range(7):
+            for j in range(7):
+                matrix[r + i][c + j] = (i in (0, 6) or j in (0, 6) or (2 <= i <= 4 and 2 <= j <= 4))
+    # 分隔符
+    for (r, c) in [(0, 0), (0, size - 8), (size - 8, 0)]:
+        for i in range(8):
+            if r + i < size and c + 7 < size:
+                matrix[r + i][c + 7] = False
+            if r + 7 < size and c + i < size:
+                matrix[r + 7][c + i] = False
+    # 对齐图案
+    if version >= 2:
+        align = _ALIGNMENT.get(version, [])
+        for ar in align:
+            for ac in align:
+                if matrix[ar][ac] is not None:
+                    continue  # 不与定位图案重叠
+                for i in range(-2, 3):
+                    for j in range(-2, 3):
+                        r, c = ar + i, ac + j
+                        if 0 <= r < size and 0 <= c < size and matrix[r][c] is None:
+                            matrix[r][c] = i in (-2, 2) or j in (-2, 2)
+    # 时序图案
+    for i in range(8, size - 8):
+        if matrix[6][i] is None:
+            matrix[6][i] = i % 2 == 0
+        if matrix[i][6] is None:
+            matrix[i][6] = i % 2 == 0
+    # 暗模块
+    matrix[size - 8][8] = True
+
+    # 预留格式信息区域（全部设 False 占位）
+    for i in range(9):
+        if matrix[i][8] is None:
+            matrix[i][8] = False
+        if matrix[8][i] is None:
+            matrix[8][i] = False
+    for i in range(8):
+        if matrix[size - 1 - i][8] is None:
+            matrix[size - 1 - i][8] = False
+        if matrix[8][size - 1 - i] is None:
+            matrix[8][size - 1 - i] = False
+
+    # 5. 放置数据位
+    data_bits = []
+    for b in final:
+        for j in range(7, -1, -1):
+            data_bits.append((b >> j) & 1)
+    col = size - 1
+    bit_idx = 0
+    going_up = True
+    while col > 0:
+        if col == 6:
+            col -= 1
+        for r in (range(size - 1, -1, -1) if going_up else range(size)):
+            for c in (col, col - 1):
+                if matrix[r][c] is None and bit_idx < len(data_bits):
+                    matrix[r][c] = bool(data_bits[bit_idx])
+                    bit_idx += 1
+        col -= 2
+        going_up = not going_up
+
+    # 6. 选择最佳掩码
+    def _mask_value(matrix, mask_pattern):
+        size = len(matrix)
+        m = [row[:] for row in matrix]
+        for r in range(size):
+            for c in range(size):
+                if m[r][c] is not None:
+                    invert = False
+                    if mask_pattern == 0:
+                        invert = (r + c) % 2 == 0
+                    elif mask_pattern == 1:
+                        invert = r % 2 == 0
+                    elif mask_pattern == 2:
+                        invert = c % 3 == 0
+                    elif mask_pattern == 3:
+                        invert = (r + c) % 3 == 0
+                    elif mask_pattern == 4:
+                        invert = (r // 2 + c // 3) % 2 == 0
+                    elif mask_pattern == 5:
+                        invert = (r * c) % 2 + (r * c) % 3 == 0
+                    elif mask_pattern == 6:
+                        invert = ((r * c) % 2 + (r * c) % 3) % 2 == 0
+                    elif mask_pattern == 7:
+                        invert = ((r + c) % 2 + (r * c) % 3) % 2 == 0
+                    if invert:
+                        m[r][c] = not bool(m[r][c]) if m[r][c] is not None else True
+        return m
+
+    def _score(m):
+        s = len(m)
+        penalty = 0
+        # 规则1：连续同色行/列
+        for r in range(s):
+            for c in range(s - 4):
+                v = m[r][c]
+                if v is not None and all(m[r][c + i] == v for i in range(5)):
+                    penalty += 3 + (1 if all(c + i < s and m[r][c + i] == v for i in range(5, min(8, s - c))) else 0)
+        for c in range(s):
+            for r in range(s - 4):
+                v = m[r][c]
+                if v is not None and all(m[r + i][c] == v for i in range(5)):
+                    penalty += 3 + (1 if all(r + i < s and m[r + i][c] == v for i in range(5, min(8, s - r))) else 0)
+        # 规则2：2x2 同色块
+        for r in range(s - 1):
+            for c in range(s - 1):
+                vals = [m[r][c], m[r][c+1], m[r+1][c], m[r+1][c+1]]
+                if None not in vals and len(set(vals)) == 1:
+                    penalty += 3
+        # 规则3：定位图案相似
+        for r in range(s):
+            for c in range(s - 10):
+                if m[r][c] is not None:
+                    pattern = [m[r][c+i] for i in range(11)]
+                    if pattern == [True,False,True,True,True,False,True,False,False,False,False]:
+                        penalty += 40
+        for c in range(s):
+            for r in range(s - 10):
+                if m[r][c] is not None:
+                    pattern = [m[r+i][c] for i in range(11)]
+                    if pattern == [True,False,True,True,True,False,True,False,False,False,False]:
+                        penalty += 40
+        # 规则4：黑白比例
+        total = sum(1 for row in m for v in row if v is not None)
+        if total == 0:
+            return penalty
+        dark = sum(1 for row in m for v in row if v)
+        ratio = dark * 100 // total
+        penalty += abs(ratio - 50) // 5 * 10
+        return penalty
+
+    best_mask = 0
+    best_score = float("inf")
+    best_matrix = None
+    for mp in range(8):
+        masked = _mask_value(matrix, mp)
+        sc = _score(masked)
+        if sc < best_score:
+            best_score = sc
+            best_mask = mp
+            best_matrix = masked
+
+    # 7. 填入格式信息
+    fmt = _FORMAT_INFO[_EC_LEVELS[ec] * 8 + best_mask]
+    fmt_bits = [(fmt >> (14 - i)) & 1 for i in range(15)]
+    coords = [(0,8),(1,8),(2,8),(3,8),(4,8),(5,8),(7,8),(8,8),(8,7),(8,5),(8,4),(8,3),(8,2),(8,1),(8,0)]
+    for idx, (r, c) in enumerate(coords):
+        if 0 <= r < size and 0 <= c < size:
+            best_matrix[r][c] = bool(fmt_bits[idx])
+    dark_coords = [(size-1,8),(size-2,8),(size-3,8),(size-4,8),(size-5,8),(size-6,8),(size-7,8),(size-8,8),
+                   (8,size-8),(8,size-7),(8,size-6),(8,size-5),(8,size-4),(8,size-3),(8,size-2),(8,size-1)]
+    for idx, (r, c) in enumerate(dark_coords):
+        if 0 <= r < size and 0 <= c < size:
+            if idx < len(fmt_bits):
+                best_matrix[r][c] = bool(fmt_bits[idx])
+
+    return best_matrix, version
 
 # --- 命令行参数 ---
 parser = argparse.ArgumentParser(description="飞递 Feidi — 局域网传输工具")
@@ -54,6 +391,7 @@ PORT = args.port
 PASSWORD = args.password or os.environ.get("FEIDI_PASSWORD", "")
 NO_BROWSER = args.no_browser
 TEMP_DIR = tempfile.mkdtemp(prefix="feidi_")
+CHUNK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feidi_chunks")
 
 # 允许端口复用，避免前次关闭后 TIME_WAIT 导致绑定失败
 socketserver.TCPServer.allow_reuse_address = True
@@ -69,6 +407,10 @@ LOCAL_IP = None  # 缓存，首次调用 get_local_ip() 后填充
 messages = []
 # 图片消息的文件路径: {msg_id: (bin_path, mime_path)}
 MSG_FILES = {}
+# 分块传输: transfer_id -> {chunks: set, total: int, info: dict, created: timestamp, sender, device_name, device_id, target_id}
+chunk_transfers = {}
+CHUNK_SIZE_LIMIT = 2 * 1024 * 1024  # 单块最大 2MB (base64 后 ~2.7MB JSON)
+MAX_CHUNKED_FILE = 500 * 1024 * 1024  # 最大 500MB
 MAX_MESSAGES = 200
 # 速率限制
 _rate_limits = {}  # {ip: [timestamps]} 滑动窗口
@@ -122,6 +464,26 @@ def cleanup():
     """退出时清理临时文件"""
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    _cleanup_stale_chunks(force=True)
+
+
+def _ensure_chunk_dir():
+    os.makedirs(CHUNK_DIR, exist_ok=True)
+
+
+def _cleanup_stale_chunks(force=False):
+    """清理过期分块（默认超过 10 分钟未完成的清理）"""
+    now = time.time()
+    timeout = 0 if force else 600  # force 时全清
+    dead = []
+    for tid, ct in list(chunk_transfers.items()):
+        if force or (now - ct.get("created", now)) > timeout:
+            dead.append(tid)
+    for tid in dead:
+        cp = os.path.join(CHUNK_DIR, tid)
+        if os.path.isdir(cp):
+            shutil.rmtree(cp, ignore_errors=True)
+        chunk_transfers.pop(tid, None)
 
 
 atexit.register(cleanup)
@@ -202,6 +564,10 @@ def check_rate_limit(client_ip):
         if len(_rate_limits[client_ip]) >= RATE_LIMIT:
             return False
         _rate_limits[client_ip].append(now)
+        # 定期清理超过 1 小时未活跃的 IP 条目
+        stale = [ip for ip, ts_list in _rate_limits.items() if not ts_list]
+        for ip in stale:
+            del _rate_limits[ip]
     return True
 
 
@@ -218,6 +584,7 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
     }
     if target_id:
         msg["target_id"] = target_id
+    msg_files = None  # (tuple of paths) or None
     if msg_type == "image":
         if data.startswith("data:"):
             header, b64 = data.split(",", 1)
@@ -232,7 +599,7 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
             f.write(img_bin)
         with open(mime_path, "w", encoding="utf-8") as f:
             f.write(mime)
-        MSG_FILES[msg_id] = (bin_path, mime_path)
+        msg_files = (bin_path, mime_path)
         msg["data"] = f"/img/{msg_id}"
     elif msg_type == "file":
         # data = {"name": str, "size": int, "mime": str, "data": base64_str}
@@ -251,11 +618,13 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
             f.write(fbin)
         with open(fmeta, "w", encoding="utf-8") as f:
             json.dump({"name": fname, "size": fsize, "mime": fmime}, f)
-        MSG_FILES[msg_id] = (fpath, fmeta)
+        msg_files = (fpath, fmeta)
         msg["data"] = {"name": fname, "size": fsize, "mime": fmime, "path": f"/file/{msg_id}"}
     else:
         msg["data"] = data
     with _msg_lock:
+        if msg_files:
+            MSG_FILES[msg_id] = msg_files
         messages.append(msg)
         if len(messages) > MAX_MESSAGES:
             old = messages.pop(0)
@@ -309,21 +678,12 @@ def broadcast_device_list():
                 sse_clients.remove(c)
 
 
-# --- QR 码 SVG 生成（基于 vendored qrcode 库，完全离线） ---
+# --- QR 码 SVG 生成（纯 Python 实现，零外部依赖） ---
 def generate_qr_svg(data, module_px=4, border=4):
-    """使用内置 qrcode 库生成 QR 码 SVG 字符串。"""
-    if _qrcode is None:
-        return (
-            '<div style="padding:16px 8px;color:#666;font-size:13px;word-break:break-all;text-align:center">'
-            'QR 库未加载，请在手机浏览器访问:<br>'
-            '<b style="color:#2e7d32;font-size:14px">%s</b></div>' % data
-        )
+    """使用内置 QR 编码器生成 SVG 二维码字符串。"""
     try:
-        qr = _qrcode.QRCode(box_size=1, border=border)
-        qr.add_data(data)
-        qr.make(fit=True)
-        mod = qr.modules
-        size = len(mod)
+        modules, version = _generate_qr_modules(data)
+        size = len(modules)
         total = (size + 2 * border) * module_px
         margin = border * module_px
         lines = [
@@ -333,7 +693,7 @@ def generate_qr_svg(data, module_px=4, border=4):
         ]
         for r in range(size):
             for c in range(size):
-                if mod[r][c]:
+                if modules[r][c]:
                     lines.append(
                         '<rect x="%d" y="%d" width="%d" height="%d" fill="#2e7d32"/>'
                         % (margin + c * module_px, margin + r * module_px, module_px, module_px)
@@ -526,6 +886,27 @@ PC_HTML = r"""<!DOCTYPE html>
   .toast{position:fixed;top:24px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,.85);color:#fff;padding:10px 20px;border-radius:24px;font-size:13px;z-index:100;opacity:0;transition:all .3s cubic-bezier(.4,0,.2,1);pointer-events:none;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(2px)}
   #fileInput{display:none}
+  /* 拖拽上传 */
+  .drop-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(59,130,246,.12);z-index:90;display:none;align-items:center;justify-content:center;pointer-events:none;border:3px dashed var(--c-primary);border-radius:12px;margin:8px;box-sizing:border-box}
+  .drop-overlay.show{display:flex}
+  .drop-overlay .drop-hint{display:flex;align-items:center;gap:8px;background:var(--c-surface);padding:16px 28px;border-radius:16px;box-shadow:var(--shadow-lg);font-size:15px;font-weight:500;color:var(--c-primary)}
+  /* 拖拽确认弹窗 */
+  .confirm-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.4);z-index:200;display:none;align-items:center;justify-content:center}
+  .confirm-overlay.show{display:flex}
+  .confirm-dialog{background:var(--c-surface);border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.25);width:420px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
+  .confirm-dialog .cd-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--c-border);font-size:15px;font-weight:600;color:var(--c-text)}
+  .confirm-dialog .cd-close{width:28px;height:28px;border:none;background:var(--c-border);color:var(--c-text2);border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px}
+  .confirm-dialog .cd-body{flex:1;overflow-y:auto;padding:12px 20px;max-height:320px}
+  .confirm-dialog .cd-file{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;background:var(--c-border-light);margin-bottom:6px}
+  .confirm-dialog .cd-file .cdf-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+  .confirm-dialog .cd-file .cdf-info{flex:1;min-width:0}
+  .confirm-dialog .cd-file .cdf-name{font-size:13px;font-weight:500;color:var(--c-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .confirm-dialog .cd-file .cdf-size{font-size:11px;color:var(--c-text3)}
+  .confirm-dialog .cd-footer{display:flex;gap:10px;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--c-border)}
+  .confirm-dialog .cd-footer button{padding:8px 20px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
+  .confirm-dialog .cd-footer .btn-cancel{border:1px solid var(--c-border);background:transparent;color:var(--c-text2)}
+  .confirm-dialog .cd-footer .btn-confirm{border:none;background:var(--c-primary);color:#fff}
+  .confirm-dialog .cd-footer .btn-confirm:hover{opacity:.9}
   /* 颜色头像 */
   .di-avatar{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;flex-shrink:0;text-transform:uppercase}
   /* 选中设备 */
@@ -580,6 +961,18 @@ PC_HTML = r"""<!DOCTYPE html>
       <button class="btn-send" onclick="sendText()" title="发送">__ICON_SEND__</button>
     </div>
     <div class="toast" id="toast"></div>
+    <!-- 拖拽上传 -->
+    <div class="drop-overlay" id="dropOverlay"><div class="drop-hint">&#x1F4E5; 释放文件即可发送</div></div>
+    <div class="confirm-overlay" id="confirmOverlay">
+      <div class="confirm-dialog">
+        <div class="cd-header"><span>&#x1F4CE; 确认发送文件</span><button class="cd-close" onclick="closeConfirm()">&#x2715;</button></div>
+        <div class="cd-body" id="confirmBody"></div>
+        <div class="cd-footer">
+          <button class="btn-cancel" onclick="closeConfirm()">取消</button>
+          <button class="btn-confirm" id="btnConfirmSend" onclick="confirmAndSend()">发送</button>
+        </div>
+      </div>
+    </div>
   </div>
   <div class="qr-panel">
     <div class="device-list" id="deviceList" style="display:none">
@@ -664,6 +1057,13 @@ PC_HTML = r"""<!DOCTYPE html>
   var prevDeviceIds = new Set();
   var selectedDevice = null; // 当前私聊目标 device_id，null=广播
   var allMessages = [];     // 所有消息缓存（用于切换会话重建）
+  var pendingDropFiles = []; // 拖拽待发送文件
+
+  // 拖拽相关元素
+  var dropOverlay = document.getElementById("dropOverlay");
+  var confirmOverlay = document.getElementById("confirmOverlay");
+  var confirmBody = document.getElementById("confirmBody");
+  var btnConfirmSend_ = document.getElementById("btnConfirmSend");
 
   // --- 身份与名称系统 ---
   var PERSISTENT_ID = "";
@@ -712,6 +1112,37 @@ PC_HTML = r"""<!DOCTYPE html>
     toastEl.style.background = isError ? "rgba(211,47,47,.9)" : "rgba(0,0,0,.75)";
     toastEl.className = "toast show";
     setTimeout(function() { toastEl.className = "toast"; }, 2500);
+  }
+
+  // 新消息通知（非当前会话）
+  var _notifyGranted = false;
+  if ("Notification" in window && Notification.permission === "granted") _notifyGranted = true;
+  function requestNotifyPermission() {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().then(function(p) { if (p === "granted") _notifyGranted = true; });
+    }
+  }
+  requestNotifyPermission();
+  function notifyMessage(msg) {
+    var senderName = msg.sender_name || getDisplayName({id: msg.device_id, name: msg.device_id, type: "pc"});
+    var preview = "";
+    if (msg.type === "text") preview = msg.data || "";
+    else if (msg.type === "image") preview = "[图片]";
+    else if (msg.type === "file") preview = "[文件] " + (msg.data && msg.data.name || "");
+    if (preview.length > 40) preview = preview.substring(0, 40) + "...";
+    if (_notifyGranted) {
+      try { new Notification(senderName + " 发来消息", {body: preview, icon: "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="14" fill="#3b82f6"/><text x="16" y="22" text-anchor="middle" fill="white" font-size="16" font-weight="bold">(senderName[0]||"?")</text></svg>')}); } catch(e) {}
+    } else {
+      showToast(senderName + ": " + (preview || "新消息"));
+    }
+    // 闪烁标题
+    var origTitle = document.title;
+    var blinkCount = 0;
+    var blink = setInterval(function() {
+      blinkCount++;
+      document.title = (blinkCount % 2 === 0) ? origTitle : "\uD83D\uDD14 " + senderName + " \u00B7 " + origTitle;
+      if (blinkCount >= 6) { clearInterval(blink); document.title = origTitle; }
+    }, 800);
   }
 
   function updateStatus(count) {
@@ -946,6 +1377,11 @@ PC_HTML = r"""<!DOCTYPE html>
     MY_ID = data.device_id;
     MY_NAME = data.name;
     MY_TYPE = data.type;
+    // 默认私聊：MY_ID 就绪后补选第一台非本机设备
+    if (!selectedDevice && sse_clients_cache && sse_clients_cache.length > 0) {
+      var others = sse_clients_cache.filter(function(d) { return d.id !== MY_ID; });
+      if (others.length > 0) switchConversation(others[0].id);
+    }
     // 如果有本地自命名，同步到服务端
     if (MY_DISPLAY_NAME && MY_DISPLAY_NAME !== data.name) {
       fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(MY_DISPLAY_NAME));
@@ -964,6 +1400,10 @@ PC_HTML = r"""<!DOCTYPE html>
     seenMsgs.add(msg.id);
     if (seenMsgs.size > 500) { seenMsgs.clear(); }
     allMessages.push(msg);
+    // 通知：来自非当前会话且非自己的消息
+    if (msg.device_id !== MY_ID && msg.device_id !== selectedDevice) {
+      notifyMessage(msg);
+    }
     // 私聊模式过滤：只显示与选中设备相关的消息
     if (selectedDevice) {
       var fromSelected = msg.device_id === selectedDevice;
@@ -975,8 +1415,8 @@ PC_HTML = r"""<!DOCTYPE html>
   evtSource.addEventListener("device_list", function(e) {
     var data = JSON.parse(e.data);
     renderDeviceList(data.devices || []);
-    // 默认私聊模式：自动选中第一台非本机设备
-    if (!selectedDevice) {
+    // 默认私聊模式：仅在 MY_ID 已知后才自动选设备
+    if (!selectedDevice && MY_ID) {
       var others = (data.devices || []).filter(function(d) { return d.id !== MY_ID; });
       if (others.length > 0) switchConversation(others[0].id);
     }
@@ -1080,6 +1520,177 @@ PC_HTML = r"""<!DOCTYPE html>
   };
   // 点击菜单外关闭（backdrop 已处理 onclick=toggleAttachMenu）
 
+  // --- 拖拽文件发送 ---
+  var dragCounter = 0;
+  document.addEventListener("dragenter", function(e) {
+    e.preventDefault(); dragCounter++;
+    if (dragCounter === 1) dropOverlay.classList.add("show");
+  });
+  document.addEventListener("dragleave", function(e) {
+    e.preventDefault(); dragCounter--;
+    if (dragCounter <= 0) { dragCounter = 0; dropOverlay.classList.remove("show"); }
+  });
+  document.addEventListener("dragover", function(e) { e.preventDefault(); });
+  document.addEventListener("drop", function(e) {
+    e.preventDefault();
+    dragCounter = 0;
+    dropOverlay.classList.remove("show");
+    var files = e.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    if (currentDeviceCount === 0) {
+      showToast("暂无设备连接，无法发送", true);
+      return;
+    }
+    pendingDropFiles = [];
+    for (var i = 0; i < files.length; i++) pendingDropFiles.push(files[i]);
+    showConfirmDialog(pendingDropFiles);
+  });
+
+  function showConfirmDialog(files) {
+    var html = "";
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      var ext = (f.name.split(".").pop() || "").toLowerCase();
+      var iconBg = "#f1f5f9", iconColor = "#64748b", iconText = "\uD83D\uDCC4";
+      if (/^(png|jpg|jpeg|gif|webp|bmp|svg)$/i.test(ext)) { iconBg = "#dbeafe"; iconColor = "#3b82f6"; iconText = "\uD83D\uDDBC"; }
+      else if (/^(mp3|wav|flac|aac|ogg|wma|m4a)$/i.test(ext)) { iconBg = "#ede9fe"; iconColor = "#7c3aed"; iconText = "\uD83C\uDFB5"; }
+      else if (/^(mp4|avi|mkv|mov|wmv|flv|webm)$/i.test(ext)) { iconBg = "#fce4ec"; iconColor = "#e91e63"; iconText = "\uD83C\uDFA5"; }
+      else if (/^(zip|rar|7z|tar|gz)$/i.test(ext)) { iconBg = "#fef3c7"; iconColor = "#d97706"; iconText = "\uD83D\uDCE6"; }
+      else if (/^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|wps|et|dps|csv|rtf|odt|ods|odp|md)$/i.test(ext)) { iconBg = "#dbeafe"; iconColor = "#2563eb"; iconText = "\uD83D\uDCC3"; }
+      html += '<div class="cd-file"><div class="cdf-icon" style="background:' + iconBg + ';color:' + iconColor + '">' + iconText + '</div>';
+      html += '<div class="cdf-info"><div class="cdf-name">' + escHtml(f.name) + '</div><div class="cdf-size">' + formatSize(f.size) + '</div></div></div>';
+    }
+    confirmBody.innerHTML = html;
+    confirmOverlay.classList.add("show");
+  }
+
+  window.closeConfirm = function() {
+    confirmOverlay.classList.remove("show");
+    pendingDropFiles = [];
+  };
+
+  window.confirmAndSend = function() {
+    if (pendingDropFiles.length === 0) return;
+    var files = pendingDropFiles.slice();
+    confirmOverlay.classList.remove("show");
+    pendingDropFiles = [];
+    files.forEach(function(file) {
+      var ext = (file.name.split(".").pop() || "").toLowerCase();
+      var isImage = /^(png|jpg|jpeg|gif|webp|bmp|svg)$/i.test(ext);
+      sendFileChunked(file, isImage);
+    });
+  };
+
+  // --- 分块传输（断点续传）---
+  var CHUNK_SIZE = 1024 * 1024;  // 1MB 每块
+  function generateTransferId() {
+    return "t" + Date.now().toString(36) + "_" + "xxxx".replace(/x/g, function() {
+      return ((Math.random() * 16) | 0).toString(16);
+    });
+  }
+
+  // 分块发送单个文件，返回 Promise
+  function sendFileChunked(file, isImage) {
+    var totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    if (totalChunks === 0) totalChunks = 1;
+    var transferId = generateTransferId();
+    var receivedSet = {};  // chunk_index -> true
+    var progressToastId = null;
+
+    function showProgress(received, total) {
+      var pct = Math.round(received / total * 100);
+      if (pct >= 100) {
+        if (progressToastId) { clearTimeout(progressToastId); progressToastId = null; }
+        return;
+      }
+      if (progressToastId) clearTimeout(progressToastId);
+      showToast("发送中 " + file.name + " (" + received + "/" + total + " " + pct + "%)");
+      progressToastId = setTimeout(function() { progressToastId = null; }, 3000);
+    }
+
+    function sendChunk(index, retryCount) {
+      retryCount = retryCount || 0;
+      if (receivedSet[index]) {
+        // 已确认收到，跳过
+        sendNext();
+        return;
+      }
+
+      var start = index * CHUNK_SIZE;
+      var end = Math.min(start + CHUNK_SIZE, file.size);
+      var blob = file.slice(start, end);
+      var reader = new FileReader();
+
+      reader.onload = function() {
+        var b64 = reader.result.split(",")[1] || reader.result;
+
+        var body = {
+          chunk_index: index,
+          total_chunks: totalChunks,
+          transfer_id: transferId,
+          chunk_data: b64,
+          file_info: {name: file.name, size: file.size, mime: file.type || "application/octet-stream"},
+          sender: SENDER,
+          device_name: MY_NAME,
+          device_id: MY_ID,
+          target_id: selectedDevice || null
+        };
+        if (isImage) body.image_type = true;
+
+        fetch("/send", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body)
+        }).then(function(r) { return r.json(); }).then(function(data) {
+          if (data.ok && data.received) {
+            data.received.forEach(function(i) { receivedSet[i] = true; });
+            showProgress(Object.keys(receivedSet).length, totalChunks);
+            if (data.complete) {
+              if (progressToastId) { clearTimeout(progressToastId); progressToastId = null; }
+              // 消息通过 SSE 广播到达，无需本地创建
+            } else {
+              sendNext();
+            }
+          } else {
+            if (retryCount < 5) {
+              setTimeout(function() { sendChunk(index, retryCount + 1); }, 1000 * (retryCount + 1));
+            } else {
+              showToast(file.name + " 分块发送失败");
+            }
+          }
+        }).catch(function() {
+          if (retryCount < 5) {
+            setTimeout(function() { sendChunk(index, retryCount + 1); }, 1000 * (retryCount + 1));
+          } else {
+            showToast(file.name + " 发送失败（网络错误）");
+          }
+        });
+      };
+
+      reader.onerror = function() {
+        if (retryCount < 3) {
+          setTimeout(function() { sendChunk(index, retryCount + 1); }, 500);
+        } else {
+          showToast(file.name + " 读取失败");
+        }
+      };
+
+      reader.readAsDataURL(blob);
+    }
+
+    function sendNext() {
+      for (var i = 0; i < totalChunks; i++) {
+        if (!receivedSet[i]) {
+          sendChunk(i);
+          return;
+        }
+      }
+    }
+
+    // 启动
+    sendChunk(0);
+  }
+
   // 图片 input — 作为图片消息发送（base64 data URI）
   imgInput.onchange = function() {
     if (currentDeviceCount === 0) {
@@ -1089,6 +1700,11 @@ PC_HTML = r"""<!DOCTYPE html>
     }
     for (var i = 0; i < imgInput.files.length; i++) {
       (function(file) {
+        // 大于 2MB 的图片走分块传输
+        if (file.size > 2 * 1024 * 1024) {
+          sendFileChunked(file, true);
+          return;
+        }
         var reader = new FileReader();
         reader.onload = function() {
           var imgDataUri = reader.result;
@@ -1121,27 +1737,7 @@ PC_HTML = r"""<!DOCTYPE html>
         return;
       }
       for (var i = 0; i < input.files.length; i++) {
-        (function(file) {
-          var reader = new FileReader();
-          reader.onload = function() {
-            var fb64 = reader.result.split(",")[1] || reader.result;
-            var fileInfo = {name: file.name, size: file.size, mime: file.type || "application/octet-stream", data: fb64};
-            fetch("/send", {
-              method: "POST",
-              headers: {"Content-Type": "application/json"},
-              body: JSON.stringify({file: fileInfo, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
-            }).then(function(r) { return r.json(); }).then(function(data) {
-              if (!data.ok) throw new Error("发送失败");
-              var localMsg = {id: data.msg_id, type: "file", data: {name: file.name, size: file.size, path: "/file/" + data.msg_id}, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
-              seenMsgs.add(localMsg.id);
-              appendMessage(localMsg, true);
-              showToast("文件已发送");
-            }).catch(function() {
-              showToast("文件过大或发送失败", true);
-            });
-          };
-          reader.readAsDataURL(file);
-        })(input.files[i]);
+        sendFileChunked(input.files[i], false);
       }
       input.value = "";
     };
@@ -1246,11 +1842,11 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   /* 设备按钮 */
   .header .devices-btn{position:absolute;left:10px;display:flex;align-items:center;gap:2px;background:rgba(255,255,255,.15);color:#fff;border:none;border-radius:14px;padding:3px 8px 3px 5px;font-size:12px;cursor:pointer}
   .header .devices-btn .db-count{background:rgba(255,255,255,.25);border-radius:10px;padding:0 5px;font-size:10px;min-width:18px;text-align:center;line-height:16px}
-  /* 设备侧边栏（从右滑出）*/
+  /* 设备侧边栏（从左滑出）*/
   .sidebar-backdrop{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.35);z-index:100;display:none;transition:opacity .2s}
   .sidebar-backdrop.show{display:block}
-  .sidebar{position:fixed;top:0;right:-280px;width:260px;height:100%;height:100dvh;background:var(--c-surface);z-index:110;transition:transform .25s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;box-shadow:-2px 0 16px rgba(0,0,0,.1);overflow:hidden}
-  .sidebar.show{transform:translateX(-280px)}
+  .sidebar{position:fixed;top:0;left:-280px;width:260px;height:100%;height:100dvh;background:var(--c-surface);z-index:110;transition:left .25s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;box-shadow:2px 0 16px rgba(0,0,0,.1);overflow:hidden}
+  .sidebar.show{left:0}
   .sidebar .sb-header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--c-border);flex-shrink:0}
   .sidebar .sb-header .sb-title{font-size:15px;font-weight:600;color:var(--c-text);display:flex;align-items:center;gap:6px}
   .sidebar .sb-header .sb-close{width:28px;height:28px;border:none;background:var(--c-border);color:var(--c-text2);border-radius:50%;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center}
@@ -1403,6 +1999,11 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     var data = JSON.parse(e.data);
     MY_ID = data.device_id;
     MY_NAME = data.name;
+    // 默认私聊：MY_ID 就绪后补选第一台非本机设备
+    if (!selectedDevice && sse_clients_cache && sse_clients_cache.length > 0) {
+      var others = sse_clients_cache.filter(function(d) { return d.id !== MY_ID; });
+      if (others.length > 0) switchConversation(others[0].id);
+    }
     if (MY_DISPLAY_NAME && MY_DISPLAY_NAME !== data.name) {
       fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(MY_DISPLAY_NAME));
     }
@@ -1420,6 +2021,10 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     seenMsgs.add(msg.id);
     if (seenMsgs.size > 500) { seenMsgs.clear(); }
     allMessages.push(msg);
+    // 通知：来自非当前会话且非自己的消息
+    if (msg.device_id !== MY_ID && msg.device_id !== selectedDevice) {
+      notifyMessage(msg);
+    }
     if (selectedDevice) {
       var fromSelected = msg.device_id === selectedDevice;
       var toSelected = msg.target_id === selectedDevice;
@@ -1430,7 +2035,8 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   evtSource.addEventListener("device_list", function(e) {
     var data = JSON.parse(e.data);
     renderSidebar(data.devices || []);
-    if (!selectedDevice) {
+    // 默认私聊模式：仅在 MY_ID 已知后才自动选设备
+    if (!selectedDevice && MY_ID) {
       var others = (data.devices || []).filter(function(d) { return d.id !== MY_ID; });
       if (others.length > 0) switchConversation(others[0].id);
     }
@@ -1478,6 +2084,25 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     toast.textContent = msg;
     toast.className = "toast show";
     setTimeout(function() { toast.className = "toast"; }, 2000);
+  }
+
+  // 新消息通知
+  var _notifyGranted_m = false;
+  if ("Notification" in window && Notification.permission === "granted") _notifyGranted_m = true;
+  if ("Notification" in window && Notification.permission === "default") {
+    Notification.requestPermission().then(function(p) { if (p === "granted") _notifyGranted_m = true; });
+  }
+  function notifyMessage(msg) {
+    var senderName = msg.sender_name || getDisplayName({id: msg.device_id, name: msg.device_id, type: "pc"});
+    var preview = "";
+    if (msg.type === "text") preview = msg.data || "";
+    else if (msg.type === "image") preview = "[图片]";
+    else if (msg.type === "file") preview = "[文件] " + (msg.data && msg.data.name || "");
+    if (preview.length > 40) preview = preview.substring(0, 40) + "...";
+    if (_notifyGranted_m) {
+      try { new Notification(senderName + " 发来消息", {body: preview}); } catch(e) {}
+    }
+    showToast(senderName + ": " + (preview || "新消息"));
   }
 
   // --- 侧边栏 ---
@@ -1668,6 +2293,63 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     msgContainer.scrollTop = msgContainer.scrollHeight;
   }
 
+  // --- 分块传输（断点续传）---
+  var CHUNK_SIZE_m = 1024 * 1024;
+  function generateTransferId() {
+    return "t" + Date.now().toString(36) + "_" + "xxxx".replace(/x/g, function() {
+      return ((Math.random() * 16) | 0).toString(16);
+    });
+  }
+  function sendFileChunked(file, isImage) {
+    var totalChunks = Math.ceil(file.size / CHUNK_SIZE_m);
+    if (totalChunks === 0) totalChunks = 1;
+    var transferId = generateTransferId();
+    var receivedSet = {};
+    function sendChunk(index, retryCount) {
+      retryCount = retryCount || 0;
+      if (receivedSet[index]) { sendNext(); return; }
+      var start = index * CHUNK_SIZE_m;
+      var end = Math.min(start + CHUNK_SIZE_m, file.size);
+      var blob = file.slice(start, end);
+      var reader = new FileReader();
+      reader.onload = function() {
+        var b64 = reader.result.split(",")[1] || reader.result;
+        var body = {
+          chunk_index: index, total_chunks: totalChunks, transfer_id: transferId, chunk_data: b64,
+          file_info: {name: file.name, size: file.size, mime: file.type || "application/octet-stream"},
+          sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null
+        };
+        if (isImage) body.image_type = true;
+        fetch("/send", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body)
+        }).then(function(r) { return r.json(); }).then(function(data) {
+          if (data.ok && data.received) {
+            data.received.forEach(function(i) { receivedSet[i] = true; });
+            if (data.complete) { /* SSE 广播 */ }
+            else { sendNext(); }
+          } else if (retryCount < 5) {
+            setTimeout(function() { sendChunk(index, retryCount + 1); }, 1000 * (retryCount + 1));
+          } else { showToast(file.name + " 发送失败"); }
+        }).catch(function() {
+          if (retryCount < 5) {
+            setTimeout(function() { sendChunk(index, retryCount + 1); }, 1000 * (retryCount + 1));
+          } else { showToast(file.name + " 发送失败"); }
+        });
+      };
+      reader.onerror = function() {
+        if (retryCount < 3) setTimeout(function() { sendChunk(index, retryCount + 1); }, 500);
+        else showToast(file.name + " 读取失败");
+      };
+      reader.readAsDataURL(blob);
+    }
+    function sendNext() {
+      for (var i = 0; i < totalChunks; i++) if (!receivedSet[i]) { sendChunk(i); return; }
+    }
+    sendChunk(0);
+  }
+
   window.sendText = function() {
     const text = textInput.value.trim();
     if (!text) return;
@@ -1706,6 +2388,10 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   imgInput.onchange = function() {
     for (var i = 0; i < imgInput.files.length; i++) {
       (function(file) {
+        if (file.size > 2 * 1024 * 1024) {
+          sendFileChunked(file, true);
+          return;
+        }
         const reader = new FileReader();
         reader.onload = function() {
           fetch("/send", {
@@ -1732,27 +2418,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   function setupFileInput(input) {
     input.onchange = function() {
       for (var i = 0; i < input.files.length; i++) {
-        (function(file) {
-          const reader = new FileReader();
-          reader.onload = function() {
-            var fb64 = reader.result.split(",")[1] || reader.result;
-            var fileInfo = {name: file.name, size: file.size, mime: file.type || "application/octet-stream", data: fb64};
-            fetch("/send", {
-              method: "POST",
-              headers: {"Content-Type": "application/json"},
-              body: JSON.stringify({file: fileInfo, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
-            }).then(function(r) { return r.json(); }).then(function(data) {
-              if (!data.ok) throw new Error("发送失败");
-              var localMsg = {id: data.msg_id, type: "file", data: {name: file.name, size: file.size, path: "/file/" + data.msg_id}, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
-              seenMsgs.add(localMsg.id);
-              appendMessage(localMsg, true);
-              showToast("文件已发送");
-            }).catch(function() {
-              showToast("文件过大或发送失败");
-            });
-          };
-          reader.readAsDataURL(file);
-        })(input.files[i]);
+        sendFileChunked(input.files[i], false);
       }
       input.value = "";
     };
@@ -1799,10 +2465,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             return True
         cookies = {}
         cookie_header = self.headers.get("Cookie", "")
-        for item in cookie_header.replace(" ", "").split(";"):
+        for item in cookie_header.split(";"):
+            item = item.strip()
             if "=" in item:
                 k, v = item.split("=", 1)
-                cookies[k] = v
+                cookies[k.strip()] = v.strip()
         return secrets.compare_digest(cookies.get("feidi_auth", ""), AUTH_TOKEN)
 
     def set_auth_cookie(self):
@@ -1874,8 +2541,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_error_body(400, "Name cannot be empty")
                 return
 
-            # 验证：只能改自己的名字（通过 IP 匹配）
-            client_ip = self.client_address[0]
+            # 通过 device_id 匹配（device_id 在 SSE 握手时分配，非公开）
             renamed = False
             with _sse_lock:
                 for c in sse_clients:
@@ -1946,9 +2612,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(fbin)
             self.wfile.flush()
 
-        elif path == "/status":
-            self.send_json(200, {"connections": len(sse_clients), "messages": len(messages)})
-
         elif path == "/events":
             if len(sse_clients) >= MAX_SSE_CLIENTS:
                 self.send_error_body(503, "Too many connections")
@@ -1982,11 +2645,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else:
                     dev_name = info.get("name", dev_name or dev_type)
                 # 更新元数据
+                old_ip = info.get("last_ip")
                 info["last_ip"] = client_ip
                 info["last_seen"] = int(time.time())
                 info["type"] = dev_type
                 # 尝试获取 MAC（如果是新 IP）
-                if info.get("last_ip") != client_ip and client_ip not in ("127.0.0.1", "::1"):
+                if old_ip != client_ip and client_ip not in ("127.0.0.1", "::1"):
                     mac = get_mac(client_ip)
                     if mac:
                         info["mac"] = mac
@@ -2017,6 +2681,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
             with _sse_lock:
+                # 清除同 device_id 的旧连接（避免刷新/重连时设备列表出现重复）
+                for i in range(len(sse_clients) - 1, -1, -1):
+                    if sse_clients[i].get("device_id") == device_id:
+                        sse_clients.pop(i)
                 sse_clients.append(dev_info)
             broadcast_device_list()
 
@@ -2105,6 +2773,106 @@ class RequestHandler(BaseHTTPRequestHandler):
             dev_id = data.get("device_id", "")
             target_id = data.get("target_id", None)  # None = 广播, str = 私聊目标
 
+            # --- 分块传输模式 ---
+            if "chunk_index" in data and "total_chunks" in data and "transfer_id" in data:
+                chunk_index = int(data["chunk_index"])
+                total_chunks = int(data["total_chunks"])
+                transfer_id = str(data["transfer_id"]).strip()
+                chunk_b64 = data.get("chunk_data", "")
+                if not transfer_id or not re.match(r'^[a-zA-Z0-9\-_]+$', transfer_id):
+                    self.send_error_body(400, "Invalid transfer_id")
+                    return
+                if chunk_index < 0 or chunk_index >= total_chunks or total_chunks > 10000:
+                    self.send_error_body(400, "Invalid chunk index or total_chunks")
+                    return
+                if len(chunk_b64) > CHUNK_SIZE_LIMIT * 2:
+                    self.send_error_body(413, "Chunk too large")
+                    return
+
+                _ensure_chunk_dir()
+                transfer_dir = os.path.join(CHUNK_DIR, transfer_id)
+                os.makedirs(transfer_dir, exist_ok=True)
+
+                # 写入分块
+                try:
+                    chunk_bin = base64.b64decode(chunk_b64)
+                except Exception:
+                    self.send_error_body(400, "Invalid chunk base64")
+                    return
+                with open(os.path.join(transfer_dir, f"{chunk_index}.chunk"), "wb") as f:
+                    f.write(chunk_bin)
+
+                # 更新追踪
+                if transfer_id not in chunk_transfers:
+                    ct_info = data.get("file_info", {})
+                    if not ct_info:
+                        ct_info = {"name": "unknown", "size": 0, "mime": "application/octet-stream"}
+                    fsize = ct_info.get("size", 0)
+                    if fsize > MAX_CHUNKED_FILE:
+                        self.send_error_body(413, f"File too large (max {MAX_CHUNKED_FILE // (1024*1024)}MB)")
+                        return
+                    if total_chunks > 10000:
+                        self.send_error_body(400, "Too many chunks")
+                        return
+                    chunk_transfers[transfer_id] = {
+                        "chunks": set(),
+                        "total": total_chunks,
+                        "info": ct_info,
+                        "created": time.time(),
+                        "sender": sender,
+                        "device_name": dev_name,
+                        "device_id": dev_id,
+                        "target_id": target_id,
+                        "is_image": data.get("image_type") is True,
+                    }
+                ct = chunk_transfers[transfer_id]
+                # 校验：后续分块必须来自同一个发送者
+                if ct["device_id"] != dev_id:
+                    self.send_error_body(403, "Transfer owned by another device")
+                    return
+                ct["chunks"].add(chunk_index)
+                received = sorted(ct["chunks"])
+                complete = len(received) == ct["total"]
+
+                if complete:
+                    # 组装文件
+                    full_bin = b""
+                    for i in range(ct["total"]):
+                        cp = os.path.join(transfer_dir, f"{i}.chunk")
+                        if not os.path.isfile(cp):
+                            self.send_error_body(400, f"Missing chunk {i}")
+                            return
+                        with open(cp, "rb") as f:
+                            full_bin += f.read()
+
+                    # 编码为 base64 并走正常消息流程
+                    fb64 = base64.b64encode(full_bin).decode()
+                    finfo = dict(ct["info"])
+                    finfo["data"] = fb64
+                    finfo["size"] = len(full_bin)  # 覆盖客户端报的大小
+
+                    if ct["is_image"]:
+                        # 构造 data URI
+                        mime = finfo.get("mime", "image/png")
+                        data_uri = f"data:{mime};base64,{fb64}"
+                        if len(data_uri) > 5 * 1024 * 1024:
+                            # 图片太大走文件模式
+                            msg_id = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+                        else:
+                            msg_id = add_message("image", data_uri, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+                    else:
+                        msg_id = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+
+                    # 清理分块
+                    shutil.rmtree(transfer_dir, ignore_errors=True)
+                    chunk_transfers.pop(transfer_id, None)
+
+                    self.send_json(200, {"ok": True, "received": received, "complete": True, "msg_id": msg_id})
+                else:
+                    self.send_json(200, {"ok": True, "received": received, "complete": False})
+                return  # 分块模式直接返回，不走后续逻辑
+            # --- 分块模式结束 ---
+
             if "text" in data and data["text"]:
                 text = data["text"]
                 if len(text) > 10000:
@@ -2149,6 +2917,40 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+def kill_old_instance(port):
+    """检查端口是否被旧的飞递进程占用，是则自动终止。不会误杀其他程序。"""
+    try:
+        if sys.platform == "win32":
+            # Windows: netstat + tasklist
+            r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.strip().split()
+                    pid = parts[-1]
+                    r2 = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=5)
+                    if "python" in r2.stdout.lower() or "feidi" in r2.stdout.lower():
+                        subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, timeout=5)
+                        print(f"  \033[90m已终止旧的飞递进程 (PID: {pid})\033[0m")
+                        time.sleep(0.5)
+                        return True
+        else:
+            # macOS / Linux: lsof + ps
+            r = subprocess.run(["lsof", "-ti:%d" % port], capture_output=True, text=True, timeout=5)
+            for pid in r.stdout.strip().split():
+                if not pid:
+                    continue
+                r2 = subprocess.run(["ps", "-p", pid, "-o", "command="], capture_output=True, text=True, timeout=3)
+                cmd = r2.stdout.strip()
+                if "transfer.py" in cmd or "Feidi" in cmd:
+                    os.kill(int(pid), signal.SIGTERM)
+                    print(f"  \033[90m已终止旧的飞递进程 (PID: {pid})\033[0m")
+                    time.sleep(0.5)
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
     local_ip = get_local_ip()
     url = f"http://{local_ip}:{PORT}"
@@ -2172,7 +2974,16 @@ def main():
     print(f"        name=\"Feidi\" dir=in action=allow protocol=TCP localport={PORT})\033[0m")
     print("-" * 52)
 
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), RequestHandler)
+    kill_old_instance(PORT)
+
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), RequestHandler)
+    except OSError as e:
+        if e.errno == 48 or e.errno == 10048:  # Address already in use
+            print(f"\n  \033[91m端口 {PORT} 已被占用，且不是飞递进程。\033[0m")
+            print(f"  请手动终止占用进程，或使用 --port 换个端口")
+            sys.exit(1)
+        raise
     if not NO_BROWSER:
         print(f"\n服务已启动，浏览器将自动打开...")
         webbrowser.open(url)
@@ -2180,10 +2991,20 @@ def main():
         print(f"\n服务已启动")
 
     try:
+        # 启动过期分块清理线程（每 5 分钟清理一次）
+        import threading
+        def _chunk_cleanup_loop():
+            while not _server_stopped:
+                time.sleep(300)
+                _cleanup_stale_chunks()
+        _server_stopped = False
+        cleanup_thread = threading.Thread(target=_chunk_cleanup_loop, daemon=True)
+        cleanup_thread.start()
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        _server_stopped = True
         server.server_close()
         print("\n已关闭，临时文件已清理")
 

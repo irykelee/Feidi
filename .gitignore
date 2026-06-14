@@ -1,11 +1,23 @@
+# 文章（不发布到 GitHub）
+article_*.md
+
+# 运行时生成的文件
+feidi_identities.json
+feidi_chunks/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# PyInstaller
 build/
 dist/
-*.txt
-test_server.log
-transfer_v1_backup.py
-build_v1_backup.spec
-feidi_build/
-article_*.md
-feidi_identities.json
+*.spec.bak

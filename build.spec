@@ -8,17 +8,6 @@
 a = Analysis(
     ['transfer.py'],
     pathex=[],
-    datas=[
-        # 包含 qrcode_lib 目录
-        ('qrcode_lib', 'qrcode_lib'),
-    ],
-    hiddenimports=[
-        'qrcode',
-        'qrcode.util',
-        'qrcode.base',
-        'qrcode.image',
-        'qrcode.image.svg',
-    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
