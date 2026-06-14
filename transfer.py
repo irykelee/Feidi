@@ -75,10 +75,47 @@ _rate_limits = {}  # {ip: [timestamps]} 滑动窗口
 _rate_lock = threading.Lock()
 RATE_LIMIT = 5     # 每秒最多 5 个请求
 RATE_WINDOW = 1.0
-# SSE 客户端列表: [{"queue": Queue, "device_id": str, "name": str, "type": str}, ...]
+# SSE 客户端列表: [{"queue": Queue, "device_id": str, "name": str, "type": str, "identity_key": str}, ...]
 sse_clients = []
 _sse_lock = threading.Lock()
 _msg_lock = threading.Lock()
+# 身份持久化: {identity_key: {device_id, name, hostname, last_ip, mac, type, first_seen, last_seen}}
+IDENTITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feidi_identities.json")
+identity_map = {}
+_server_hostname = socket.gethostname()
+
+
+def load_identities():
+    global identity_map
+    try:
+        if os.path.exists(IDENTITY_FILE):
+            with open(IDENTITY_FILE, "r", encoding="utf-8") as f:
+                identity_map = json.load(f)
+    except Exception:
+        identity_map = {}
+
+
+def save_identities():
+    try:
+        with open(IDENTITY_FILE, "w", encoding="utf-8") as f:
+            json.dump(identity_map, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def get_mac(ip):
+    """尝试通过 arp 表获取指定 IP 的 MAC 地址。"""
+    try:
+        result = subprocess.run(["arp", "-a", ip], capture_output=True, text=True, timeout=3)
+        match = re.search(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", result.stdout)
+        if match:
+            return match.group(0).replace("-", ":").upper()
+    except Exception:
+        pass
+    return None
+
+
+load_identities()
 
 
 def cleanup():
@@ -168,8 +205,8 @@ def check_rate_limit(client_ip):
     return True
 
 
-def add_message(msg_type, data, sender, device_name="", device_id=""):
-    """添加消息并通知所有 SSE 客户端，排除发送者自身"""
+def add_message(msg_type, data, sender, device_name="", device_id="", target_id=None):
+    """添加消息并通知所有 SSE 客户端。target_id 为 None 则广播，否则仅发送给指定设备。发送者始终排除。"""
     msg_id = str(uuid.uuid4())
     msg = {
         "id": msg_id,
@@ -179,6 +216,8 @@ def add_message(msg_type, data, sender, device_name="", device_id=""):
         "device_id": device_id,
         "time": int(time.time() * 1000),
     }
+    if target_id:
+        msg["target_id"] = target_id
     if msg_type == "image":
         if data.startswith("data:"):
             header, b64 = data.split(",", 1)
@@ -221,12 +260,15 @@ def add_message(msg_type, data, sender, device_name="", device_id=""):
         if len(messages) > MAX_MESSAGES:
             old = messages.pop(0)
             _cleanup_msg_files(old["id"])
-    broadcast_sse("new_message", msg, exclude_device=device_id if device_id else None)
+    broadcast_sse("new_message", msg, exclude_device=device_id if not target_id and device_id else None, target_id=target_id)
     return msg_id
 
 
-def broadcast_sse(event, data, exclude_device=None):
-    """向所有 SSE 客户端广播事件。exclude_device 排除指定设备。"""
+def broadcast_sse(event, data, exclude_device=None, target_id=None):
+    """向 SSE 客户端广播事件。
+    target_id: 仅发送给指定设备（私聊模式）
+    exclude_device: 排除指定设备（广播模式，排除发送者自身）
+    两者互斥，target_id 优先。"""
     dead = []
     if isinstance(data, (dict, list)):
         json_data = json.dumps(data, ensure_ascii=False)
@@ -236,7 +278,11 @@ def broadcast_sse(event, data, exclude_device=None):
         json_data = json.dumps(data, ensure_ascii=False)
     with _sse_lock:
         for c in sse_clients:
-            if exclude_device and c.get("device_id") == exclude_device:
+            cid = c.get("device_id", "")
+            if target_id:
+                if cid != target_id:
+                    continue
+            elif exclude_device and cid == exclude_device:
                 continue
             try:
                 c["queue"].put_nowait(f"event: {event}\ndata: {json_data}\n\n")
@@ -250,7 +296,7 @@ def broadcast_sse(event, data, exclude_device=None):
 def broadcast_device_list():
     """广播当前连接的设备列表"""
     with _sse_lock:
-        devices = [{"id": c["device_id"], "name": c["name"], "type": c["type"]} for c in sse_clients]
+        devices = [{"id": c["device_id"], "name": c["name"], "type": c["type"], "identity_key": c.get("identity_key", "")} for c in sse_clients]
         data = json.dumps({"devices": devices, "count": len(devices)}, ensure_ascii=False)
         dead = []
         for c in sse_clients:
@@ -302,6 +348,42 @@ def generate_qr_svg(data, module_px=4, border=4):
         )
 
 
+# --- SVG 图标（内联，不依赖任何外部资源） ---
+SVG = {
+    # 发送 — 纸飞机
+    "send": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg>',
+    # 图片 — 山水画框
+    "image": '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>',
+    # 文件 — 回形针
+    "file": '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>',
+    # 暗色模式 — 月牙
+    "moon": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+    # 亮色模式 — 太阳
+    "sun": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',
+    # 拍照 — 相机
+    "camera": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>',
+    # 电脑 — 显示器
+    "monitor": '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
+    # 手机 — 智能手机
+    "phone": '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>',
+    # 局域网 — 地球
+    "globe": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+    # 警告 — 三角叹号
+    "warn": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+    # 信号 — WiFi 弧
+    "signal": '<svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="currentColor" stroke="none"/></svg>',
+    # 信封 — 邮件
+    "mail": '<svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>',
+    # 加号 — 附件入口
+    "plus": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+    # 音乐 — 音符 (菜单-音频)
+    "music": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+    # 视频 — 播放按钮 (菜单-视频)
+    "video": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>',
+    # 文档 — 文本文件 (菜单-文档)
+    "doc": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>',
+}
+
 # --- PC 端 HTML（完全离线，QR 码由服务端 SVG 直接嵌入） ---
 PC_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -347,9 +429,9 @@ PC_HTML = r"""<!DOCTYPE html>
   .status-dot.offline{background:#94a3b8}
   .status-text{font-size:11px;color:var(--c-text2);font-weight:500}
   .messages{flex:1;overflow-y:auto;padding:16px;min-height:220px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}
-  .msg{max-width:78%;padding:10px 15px;border-radius:var(--radius-xs);font-size:14px;line-height:1.65;word-break:break-word;animation:msgIn .25s cubic-bezier(.4,0,.2,1);position:relative}
+  .msg{max-width:78%;padding:10px 15px;border-radius:var(--radius-xs);font-size:14px;line-height:1.65;word-break:break-word;animation:msgIn .25s cubic-bezier(.4,0,.2,1);position:relative;background:var(--c-msg-mobile);color:var(--c-text)}
   .msg.pc{align-self:flex-end;background:var(--c-msg-pc);color:#064e3b;border-bottom-right-radius:4px;border:1px solid #a7f3d0}
-  [data-theme="dark"] .msg.pc{color:#6ee7b7;border-color:#047857}
+  [data-theme="dark"] .msg.pc{color:#6ee7b7;border-color:#047857;background:#134e4a}
   .msg.mobile{align-self:flex-start;background:var(--c-msg-mobile);color:var(--c-text);border-bottom-left-radius:4px;border:1px solid var(--c-border)}
   .msg img{max-width:220px;max-height:220px;border-radius:8px;cursor:pointer;display:block;margin-top:6px;transition:transform .15s}
   .msg img:hover{transform:scale(1.02)}
@@ -364,10 +446,27 @@ PC_HTML = r"""<!DOCTYPE html>
   .input-area .btn-send{width:42px;height:42px;border:none;background:linear-gradient(135deg,var(--c-primary),#10b981);color:#fff;border-radius:50%;cursor:pointer;font-size:17px;flex-shrink:0;transition:all .2s;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(5,150,105,.25)}
   .input-area .btn-send:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(5,150,105,.35)}
   .input-area .btn-send:active{transform:scale(.95)}
-  .input-area .btn-img{width:38px;height:38px;border:1.5px dashed var(--c-border);background:transparent;color:var(--c-text2);border-radius:var(--radius-xs);cursor:pointer;font-size:20px;flex-shrink:0;transition:all .2s;display:flex;align-items:center;justify-content:center}
-  .input-area .btn-img:hover{background:var(--c-primary-light);border-color:var(--c-primary);color:var(--c-primary)}
-  .input-area .btn-file{width:38px;height:38px;border:1.5px dashed var(--c-border);background:transparent;color:var(--c-text2);border-radius:var(--radius-xs);cursor:pointer;font-size:16px;flex-shrink:0;transition:all .2s;display:flex;align-items:center;justify-content:center}
-  .input-area .btn-file:hover{background:var(--c-primary-light);border-color:var(--c-primary);color:var(--c-primary)}
+  .input-area .btn-attach{width:38px;height:38px;border:1.5px dashed var(--c-border);background:transparent;color:var(--c-text2);border-radius:var(--radius-xs);cursor:pointer;font-size:20px;flex-shrink:0;transition:all .2s;display:flex;align-items:center;justify-content:center;position:relative}
+  .input-area .btn-attach:hover,.input-area .btn-attach.active{background:var(--c-primary-light);border-color:var(--c-primary);color:var(--c-primary)}
+  /* 附件弹出菜单 */
+  .attach-backdrop{position:fixed;top:0;left:0;width:100%;height:100%;z-index:50;display:none}
+  .attach-backdrop.show{display:block}
+  .attach-menu{position:absolute;bottom:56px;left:14px;background:var(--c-surface);border:1px solid var(--c-border);border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.12);z-index:60;overflow:hidden;display:none;min-width:160px}
+  .attach-menu.show{display:block;animation:menuIn .15s ease}
+  @keyframes menuIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+  .attach-menu .menu-item{display:flex;align-items:center;gap:10px;padding:10px 16px;cursor:pointer;font-size:13px;color:var(--c-text);transition:background .15s;white-space:nowrap}
+  .attach-menu .menu-item:hover{background:var(--c-primary-light);color:var(--c-primary)}
+  .attach-menu .menu-item .mi-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+  .attach-menu .menu-item .mi-icon.img{background:#e8f5e9;color:#43a047}
+  .attach-menu .menu-item .mi-icon.audio{background:#fff3e0;color:#ef6c00}
+  .attach-menu .menu-item .mi-icon.video{background:#fce4ec;color:#e91e63}
+  .attach-menu .menu-item .mi-icon.doc{background:#e3f2fd;color:#1e88e5}
+  .attach-menu .menu-item .mi-icon.other{background:#f3e5f5;color:#8e24aa}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.img{background:#1b5e20;color:#81c784}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.audio{background:#4e342e;color:#ffb74d}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.video{background:#880e4f;color:#f48fb1}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.doc{background:#0d47a1;color:#90caf9}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.other{background:#4a148c;color:#ce93d8}
   /* 文件消息 */
   .msg .file-card{display:flex;align-items:center;gap:10px;padding:8px;background:rgba(255,255,255,.5);border-radius:8px;cursor:pointer;transition:background .15s}
   .msg .file-card:hover{background:rgba(255,255,255,.8)}
@@ -402,6 +501,8 @@ PC_HTML = r"""<!DOCTYPE html>
   .device-item .di-type{font-size:10px;color:var(--c-text3)}
   .device-item .di-badge{font-size:9px;padding:1px 6px;border-radius:8px;font-weight:500}
   .device-item .di-badge.me{background:var(--c-primary-light);color:var(--c-primary)}
+  .device-item .di-badge.remark{background:#fef3c7;color:#d97706}
+  [data-theme="dark"] .device-item .di-badge.remark{background:#78350f;color:#fbbf24}
   .device-item .di-status{width:6px;height:6px;border-radius:50%;background:#10b981;flex-shrink:0}
   .device-empty{text-align:center;padding:16px;color:var(--c-text3);font-size:12px}
   /* QR 折叠 */
@@ -425,6 +526,16 @@ PC_HTML = r"""<!DOCTYPE html>
   .toast{position:fixed;top:24px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,.85);color:#fff;padding:10px 20px;border-radius:24px;font-size:13px;z-index:100;opacity:0;transition:all .3s cubic-bezier(.4,0,.2,1);pointer-events:none;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(2px)}
   #fileInput{display:none}
+  /* 颜色头像 */
+  .di-avatar{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;flex-shrink:0;text-transform:uppercase}
+  /* 选中设备 */
+  .device-item{cursor:pointer}
+  .device-item.selected{background:var(--c-primary-light) !important;border-radius:8px}
+  .device-item.me{cursor:default}
+  /* 内联改名 */
+  .di-name.editable{cursor:text;border-bottom:1px dashed transparent;transition:all .15s}
+  .di-name.editable:hover{border-bottom-color:var(--c-border)}
+  .di-name-input{font-size:13px;font-weight:500;color:var(--c-text);border:none;border-bottom:1.5px solid var(--c-primary);outline:none;padding:0;margin:0;width:100%;background:transparent;font-family:inherit}
   ::-webkit-scrollbar{width:4px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:var(--c-border);border-radius:10px}
@@ -435,9 +546,9 @@ PC_HTML = r"""<!DOCTYPE html>
 <div class="container">
   <div class="panel">
     <div class="panel-header">
-      <span class="logo-text">飞递 Feidi</span>
+      <span class="logo-text" id="chatTitle">飞递 Feidi</span>
       <span class="logo-dot"></span>
-      <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换深色模式">&#x263E;</button>
+      <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换深色模式">__ICON_MOON__</button>
     </div>
     <div class="status-row">
       <span class="status-dot offline" id="statusDot"></span>
@@ -445,25 +556,35 @@ PC_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="messages" id="messages">
       <div class="empty-state" id="emptyState">
-        <div class="empty-icon">&#x1F4E1;</div>
+        <div class="empty-icon">__ICON_SIGNAL__</div>
         <div>手机扫码后即可开始互传</div>
         <div style="font-size:11px;color:var(--c-text3)">文本、图片实时同步</div>
       </div>
     </div>
     <div class="input-area">
-      <input type="file" id="fileInput" accept="image/*" multiple>
-      <input type="file" id="docInput" multiple>
-      <button class="btn-img" onclick="pickImage()" title="发送图片">+</button>
-      <button class="btn-file" onclick="pickFile()" title="发送文件">&#x1F4CE;</button>
+      <input type="file" id="imgInput" accept="image/*" multiple style="display:none">
+      <input type="file" id="audioInput" accept="audio/*" multiple style="display:none">
+      <input type="file" id="videoInput" accept="video/*" multiple style="display:none">
+      <input type="file" id="docInput" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.wps,.et,.dps,.csv,.rtf,.odt,.ods,.odp,.md" multiple style="display:none">
+      <input type="file" id="otherInput" multiple style="display:none">
+      <button class="btn-attach" id="btnAttach" onclick="toggleAttachMenu()" title="添加附件">__ICON_PLUS__</button>
+      <div class="attach-backdrop" id="attachBackdrop" onclick="toggleAttachMenu()"></div>
+      <div class="attach-menu" id="attachMenu">
+        <div class="menu-item" onclick="pickFile('img')"><span class="mi-icon img">__ICON_IMAGE__</span>图片</div>
+        <div class="menu-item" onclick="pickFile('audio')"><span class="mi-icon audio">__ICON_MUSIC__</span>音频</div>
+        <div class="menu-item" onclick="pickFile('video')"><span class="mi-icon video">__ICON_VIDEO__</span>视频</div>
+        <div class="menu-item" onclick="pickFile('doc')"><span class="mi-icon doc">__ICON_DOC__</span>文档</div>
+        <div class="menu-item" onclick="pickFile('other')"><span class="mi-icon other">__ICON_FILE__</span>其他文件</div>
+      </div>
       <textarea id="textInput" rows="1" placeholder="输入消息..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendText()}"></textarea>
-      <button class="btn-send" onclick="sendText()" title="发送">&#8593;</button>
+      <button class="btn-send" onclick="sendText()" title="发送">__ICON_SEND__</button>
     </div>
     <div class="toast" id="toast"></div>
   </div>
   <div class="qr-panel">
     <div class="device-list" id="deviceList" style="display:none">
       <div class="dl-header">
-        <span class="dl-title">&#x1F4BB; 已连接设备</span>
+        <span class="dl-title">__ICON_MONITOR__ 已连接设备</span>
         <span class="dl-count" id="dlCount">0</span>
       </div>
       <div class="dl-body" id="dlBody">
@@ -472,22 +593,22 @@ PC_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="qr-section" id="qrSection">
       <div class="qr-box" id="qrBox">
-        <div class="qr-title">&#x1F4F1; 手机扫码连接</div>
+        <div class="qr-title">__ICON_PHONE__ 手机扫码连接</div>
         <div class="qr-svg-wrapper">__QR_SVG__</div>
         <div class="qr-url">__MOBILE_URL__</div>
       </div>
       <div class="info" id="infoBox">
         <div class="info-item">
-          <div class="info-icon green">&#x1F310;</div>
+          <div class="info-icon green">__ICON_GLOBE__</div>
           <div class="info-text"><b>局域网传输</b>数据不经过外网，安全私密</div>
         </div>
         <div class="info-item">
-          <div class="info-icon amber">&#x26A0;</div>
+          <div class="info-icon amber">__ICON_WARN__</div>
           <div class="info-text"><b>扫码提示</b>请用手机相机或浏览器扫码，微信内置浏览器可能打不开</div>
         </div>
       </div>
     </div>
-    <button class="qr-toggle-btn" id="qrToggleBtn" onclick="toggleQr()">&#x1F4F1; 显示二维码</button>
+    <button class="qr-toggle-btn" id="qrToggleBtn" onclick="toggleQr()">__ICON_PHONE__ 显示二维码</button>
   </div>
 </div>
 <script>
@@ -497,7 +618,7 @@ PC_HTML = r"""<!DOCTYPE html>
   const toggleBtn = document.getElementById("themeToggle");
   function setTheme(theme) {
     document.documentElement.setAttribute("data-theme", theme);
-    toggleBtn.innerHTML = theme === "dark" ? "&#x2600;" : "&#x263E;";
+    toggleBtn.innerHTML = theme === "dark" ? '__ICON_SUN__' : '__ICON_MOON__';
     toggleBtn.title = theme === "dark" ? "切换亮色模式" : "切换深色模式";
     try { localStorage.setItem(KEY, theme); } catch(e) {}
   }
@@ -522,7 +643,14 @@ PC_HTML = r"""<!DOCTYPE html>
   const msgContainer = document.getElementById("messages");
   let emptyState = document.getElementById("emptyState");
   const textInput = document.getElementById("textInput");
-  const fileInput = document.getElementById("fileInput");
+  const imgInput = document.getElementById("imgInput");
+  const audioInput = document.getElementById("audioInput");
+  const videoInput = document.getElementById("videoInput");
+  const docInput = document.getElementById("docInput");
+  const otherInput = document.getElementById("otherInput");
+  const btnAttach = document.getElementById("btnAttach");
+  const attachMenu = document.getElementById("attachMenu");
+  const attachBackdrop = document.getElementById("attachBackdrop");
   const statusDot = document.getElementById("statusDot");
   const statusText = document.getElementById("statusText");
   const toastEl = document.getElementById("toast");
@@ -532,7 +660,52 @@ PC_HTML = r"""<!DOCTYPE html>
   const deviceList = document.getElementById("deviceList");
   const dlBody = document.getElementById("dlBody");
   const dlCount = document.getElementById("dlCount");
-  const docInput = document.getElementById("docInput");
+  var currentDeviceCount = 0;
+  var prevDeviceIds = new Set();
+  var selectedDevice = null; // 当前私聊目标 device_id，null=广播
+  var allMessages = [];     // 所有消息缓存（用于切换会话重建）
+
+  // --- 身份与名称系统 ---
+  var PERSISTENT_ID = "";
+  try { PERSISTENT_ID = localStorage.getItem("feidi_pid"); } catch(e) {}
+  if (!PERSISTENT_ID) {
+    PERSISTENT_ID = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
+      var r = Math.random() * 16 | 0, v = c === "x" ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+    try { localStorage.setItem("feidi_pid", PERSISTENT_ID); } catch(e) {}
+  }
+  var MY_HOSTNAME = "电脑";
+  try {
+    var ua = navigator.userAgent;
+    if (/Windows/.test(ua)) MY_HOSTNAME = "Windows";
+    else if (/Mac/.test(ua)) MY_HOSTNAME = "Mac";
+    else if (/Linux/.test(ua)) MY_HOSTNAME = "Linux";
+  } catch(e) {}
+  var MY_DISPLAY_NAME = "";
+  try { MY_DISPLAY_NAME = localStorage.getItem("feidi_myname") || ""; } catch(e) {}
+  var remarks = {}; // 我给其他设备的备注
+  try { remarks = JSON.parse(localStorage.getItem("feidi_remarks") || "{}"); } catch(e) {}
+
+  function getDisplayName(device) {
+    if (remarks[device.id]) return remarks[device.id];
+    return device.name || device.type;
+  }
+  function saveRemarks() {
+    try { localStorage.setItem("feidi_remarks", JSON.stringify(remarks)); } catch(e) {}
+  }
+  function saveMyName(name) {
+    MY_DISPLAY_NAME = name;
+    try { localStorage.setItem("feidi_myname", name); } catch(e) {}
+  }
+
+  function getAvatarColor(name) {
+    var hash = 0;
+    for (var i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    var h = ((hash % 360) + 360) % 360;
+    return "hsl(" + h + ", 55%, 48%)";
+  }
+  function getAvatarLetter(name) { return (name || "?")[0].toUpperCase(); }
 
   function showToast(msg, isError) {
     toastEl.textContent = msg;
@@ -542,12 +715,10 @@ PC_HTML = r"""<!DOCTYPE html>
   }
 
   function updateStatus(count) {
+    currentDeviceCount = count;
     if (count > 0) {
       statusDot.className = "status-dot online";
       statusText.textContent = "已连接 (" + count + " 台设备)";
-      // 折叠二维码
-      if (qrBox) { qrBox.classList.add("collapsed"); }
-      if (infoBox) { infoBox.style.display = "none"; }
       if (qrToggleBtn) { qrToggleBtn.classList.add("visible"); }
     } else {
       statusDot.className = "status-dot offline";
@@ -562,42 +733,194 @@ PC_HTML = r"""<!DOCTYPE html>
     if (qrBox.classList.contains("collapsed")) {
       qrBox.classList.remove("collapsed");
       if (infoBox) infoBox.style.display = "";
-      qrToggleBtn.textContent = "收起二维码";
+      qrToggleBtn.innerHTML = '__ICON_PHONE__ 收起二维码';
     } else {
       qrBox.classList.add("collapsed");
       if (infoBox) infoBox.style.display = "none";
-      qrToggleBtn.textContent = "显示二维码";
+      qrToggleBtn.innerHTML = '__ICON_PHONE__ 显示二维码';
     }
   };
 
+  var chatTitle = document.getElementById("chatTitle");
+
+  function updateChatTitle() {
+    if (!chatTitle) return;
+    if (selectedDevice) {
+      var name = selectedDevice;
+      for (var i = 0; i < (sse_clients_cache || []).length; i++) {
+        if (sse_clients_cache[i].id === selectedDevice) { name = getDisplayName(sse_clients_cache[i]); break; }
+      }
+      chatTitle.textContent = name;
+    } else {
+      chatTitle.textContent = "飞递 Feidi";
+    }
+  }
+
+  function switchConversation(deviceId) {
+    if (deviceId === selectedDevice) return; // 同一个，不切换
+    selectedDevice = deviceId;
+    updateChatTitle();
+    // 高亮选中设备
+    var items = document.querySelectorAll(".device-item");
+    items.forEach(function(el) { el.classList.remove("selected"); });
+    if (deviceId) {
+      var sel = document.getElementById("dev-" + deviceId);
+      if (sel) sel.classList.add("selected");
+    }
+    // 重建消息列表
+    rebuildMessages();
+  }
+
+  var sse_clients_cache = [];
+
+  function rebuildMessages() {
+    var list = msgContainer.querySelectorAll(".msg");
+    list.forEach(function(el) { el.remove(); });
+    var empty = document.getElementById("emptyState");
+    if (empty && empty.parentNode) empty.parentNode.removeChild(empty);
+    allMessages.forEach(function(m) {
+      if (selectedDevice) {
+        var fromSelected = m.device_id === selectedDevice;
+        var toSelected = m.target_id === selectedDevice;
+        if (!fromSelected && !((m.device_id === MY_ID) && toSelected)) return;
+      }
+      appendMessage(m, false);
+    });
+    if (!msgContainer.querySelector(".msg")) {
+      if (emptyState) msgContainer.appendChild(emptyState);
+    }
+  }
+
   // 设备列表渲染
   function renderDeviceList(devices) {
+    // 缓存设备列表供其他函数使用
+    sse_clients_cache = devices;
     if (!deviceList || !dlBody) return;
     var count = devices.length;
     dlCount.textContent = count;
     if (count === 0) {
       deviceList.style.display = "none";
       updateStatus(0);
+      prevDeviceIds = new Set();
       return;
     }
     deviceList.style.display = "block";
     var otherCount = 0;
     var html = "";
+    // 如果选中设备已断开，自动回到广播
+    if (selectedDevice) {
+      var stillHere = false;
+      devices.forEach(function(d) { if (d.id === selectedDevice) stillHere = true; });
+      if (!stillHere) switchConversation(null);
+    }
+    // 检测新设备（跳过首次加载）
+    var newDevices = [];
+    if (prevDeviceIds.size > 0) {
+      devices.forEach(function(d) {
+        if (d.id !== MY_ID && !prevDeviceIds.has(d.id)) {
+          newDevices.push(d);
+        }
+      });
+    }
     devices.forEach(function(d) {
       var isMe = d.id === MY_ID;
       if (!isMe) otherCount++;
-      var icon = d.type === "mobile" ? "&#x1F4F1;" : "&#x1F4BB;";
-      var iconCls = d.type === "mobile" ? "mobile" : "pc";
-      html += '<div class="device-item">' +
-        '<div class="di-icon ' + iconCls + '">' + icon + '</div>' +
-        '<div class="di-info"><div class="di-name">' + escHtml(d.name || d.type) + (isMe ? ' <span class="di-badge me">本机</span>' : '') + '</div>' +
-        '<div class="di-type">' + (d.type === "mobile" ? "手机" : "电脑") + '</div></div>' +
+      var displayName = getDisplayName(d);
+      var isRemark = !!remarks[d.id];
+      var avatarColor = getAvatarColor(displayName);
+      var avatarLetter = getAvatarLetter(displayName);
+      var selCls = (d.id === selectedDevice) ? " selected" : "";
+      var meCls = isMe ? " me" : "";
+      var remarkTag = isRemark ? ' <span class="di-badge remark">备注</span>' : '';
+      html += '<div class="device-item' + selCls + meCls + '" id="dev-' + d.id + '" data-device-id="' + d.id + '">' +
+        '<div class="di-avatar" style="background:' + avatarColor + '">' + avatarLetter + '</div>' +
+        '<div class="di-info"><div class="di-name' + (isMe ? " editable" : " editable") + '"' + ' onclick="event.stopPropagation();startRename(\'' + d.id + '\')"' + '>' + escHtml(displayName) + (isMe ? ' <span class="di-badge me">本机</span>' : '') + remarkTag + '</div>' +
+        '<div class="di-type">' + (d.type === "mobile" ? "手机" : "电脑") + (isRemark ? ' — ' + escHtml(d.name || d.type) : '') + '</div></div>' +
         '<div class="di-status"></div>' +
         '</div>';
     });
+    // 显示新设备连接提示
+    newDevices.forEach(function(d) {
+      showToast(d.name + " 已连接");
+    });
+    // 有新设备连入时才折叠二维码，给 3 秒让用户看到提示
+    if (newDevices.length > 0) {
+      setTimeout(function() {
+        if (qrBox) { qrBox.classList.add("collapsed"); }
+        if (infoBox) { infoBox.style.display = "none"; }
+      }, 3000);
+    }
+    // 更新 prevDeviceIds
+    prevDeviceIds = new Set();
+    devices.forEach(function(d) { prevDeviceIds.add(d.id); });
     dlBody.innerHTML = html;
+    // 设备点击：切换会话（非本机）
+    dlBody.querySelectorAll(".device-item").forEach(function(el) {
+      el.addEventListener("click", function() {
+        var did = el.getAttribute("data-device-id");
+        if (did === MY_ID) return; // 不能跟自己私聊
+        switchConversation(did === selectedDevice ? null : did);
+      });
+    });
     updateStatus(otherCount);
   }
+
+  window.startRename = function(deviceId) {
+    var nameEl = document.querySelector("#dev-" + deviceId + " .di-name");
+    if (!nameEl) return;
+    var isMe = deviceId === MY_ID;
+    var oldName = isMe ? (MY_DISPLAY_NAME || MY_HOSTNAME) : (remarks[deviceId] || "");
+    var placeholder = isMe ? "给自己起个名字" : "添加备注（仅自己可见）";
+
+    var input = document.createElement("input");
+    input.className = "di-name-input";
+    input.value = oldName;
+    input.placeholder = placeholder;
+    input.setAttribute("data-device-id", deviceId);
+
+    var save = function() {
+      var newName = input.value.trim().slice(0, 20);
+      if (isMe) {
+        // 改自己的对外名称
+        if (newName && newName !== MY_DISPLAY_NAME) {
+          saveMyName(newName);
+          MY_NAME = newName;
+          // 同步到服务端，所有人可见
+          fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(newName))
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+              if (d.name) {
+                for (var i = 0; i < (sse_clients_cache || []).length; i++) {
+                  if (sse_clients_cache[i].id === MY_ID) { sse_clients_cache[i].name = d.name; break; }
+                }
+                updateChatTitle();
+              }
+            }).catch(function(){});
+        }
+      } else {
+        // 给别人设备注（纯本地）
+        if (newName) {
+          remarks[deviceId] = newName;
+        } else {
+          delete remarks[deviceId];
+        }
+        saveRemarks();
+        // 重建设备列表以显示备注
+        if (sse_clients_cache) renderDeviceList(sse_clients_cache);
+      }
+      nameEl.style.display = "";
+      input.remove();
+    };
+    input.addEventListener("blur", save);
+    input.addEventListener("keydown", function(e) {
+      if (e.key === "Enter") { input.blur(); }
+      if (e.key === "Escape") { input.value = oldName; input.blur(); }
+    });
+    nameEl.style.display = "none";
+    nameEl.parentNode.insertBefore(input, nameEl);
+    input.focus();
+    input.select();
+  };
 
   function escHtml(s) {
     var d = document.createElement("div");
@@ -614,30 +937,39 @@ PC_HTML = r"""<!DOCTYPE html>
     return (i === 0 ? s : s.toFixed(1)) + " " + units[i];
   }
 
-  // SSE — 带设备参数
-  var deviceName = "电脑";
-  try { deviceName = /Mac|Win|Linux/.exec(navigator.userAgent) ? decodeURIComponent(/Mac|Win|Linux/.exec(navigator.userAgent)[0]) : "电脑"; } catch(e) {}
+  // SSE — 带身份参数
   var seenMsgs = new Set();
-  var evtSource = new EventSource("/events?type=" + MY_TYPE + "&name=" + encodeURIComponent(deviceName));
+  var evtSource = new EventSource("/events?type=" + MY_TYPE + "&pid=" + encodeURIComponent(PERSISTENT_ID) + "&name=" + encodeURIComponent(MY_HOSTNAME) + (MY_DISPLAY_NAME ? "&my_name=" + encodeURIComponent(MY_DISPLAY_NAME) : ""));
 
   evtSource.addEventListener("device_id", function(e) {
     var data = JSON.parse(e.data);
     MY_ID = data.device_id;
     MY_NAME = data.name;
     MY_TYPE = data.type;
+    // 如果有本地自命名，同步到服务端
+    if (MY_DISPLAY_NAME && MY_DISPLAY_NAME !== data.name) {
+      fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(MY_DISPLAY_NAME));
+    }
   });
 
   evtSource.addEventListener("history", function(e) {
     var msgs = JSON.parse(e.data);
     msgs.forEach(function(m) {
-      if (!seenMsgs.has(m.id)) { seenMsgs.add(m.id); appendMessage(m, false); }
+      if (!seenMsgs.has(m.id)) { seenMsgs.add(m.id); allMessages.push(m); appendMessage(m, false); }
     });
   });
   evtSource.addEventListener("new_message", function(e) {
     var msg = JSON.parse(e.data);
     if (seenMsgs.has(msg.id)) return;
     seenMsgs.add(msg.id);
-    if (seenMsgs.size > 500) { seenMsgs.clear(); }  // 防止内存无限增长
+    if (seenMsgs.size > 500) { seenMsgs.clear(); }
+    allMessages.push(msg);
+    // 私聊模式过滤：只显示与选中设备相关的消息
+    if (selectedDevice) {
+      var fromSelected = msg.device_id === selectedDevice;
+      var toSelected = msg.target_id === selectedDevice;
+      if (!fromSelected && !((msg.device_id === MY_ID) && toSelected)) return;
+    }
     appendMessage(msg, true);
   });
   evtSource.addEventListener("device_list", function(e) {
@@ -651,6 +983,13 @@ PC_HTML = r"""<!DOCTYPE html>
   };
 
   function appendMessage(msg, animate) {
+    // 去重存储到 allMessages
+    var dup = false;
+    for (var ai = 0; ai < allMessages.length; ai++) {
+      if (allMessages[ai].id === msg.id) { dup = true; break; }
+    }
+    if (!dup) allMessages.push(msg);
+
     if (emptyState) { emptyState.remove(); emptyState = null; }
     var isMe = (msg.device_id && msg.device_id === MY_ID) || msg.sender === SENDER;
     var div = document.createElement("div");
@@ -697,14 +1036,18 @@ PC_HTML = r"""<!DOCTYPE html>
   window.sendText = function() {
     var text = textInput.value.trim();
     if (!text) return;
+    if (currentDeviceCount === 0) {
+      showToast("暂无设备连接，无法发送", true);
+      return;
+    }
     fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID})
+      body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
     }).then(function(r) { return r.json(); }).then(function(data) {
       if (!data.ok) throw new Error("发送失败");
       // 本地立即显示（因 exclude_device 不会通过 SSE 回传）
-      var localMsg = {id: data.msg_id, type: "text", data: text, sender: SENDER, sender_name: "我", device_id: MY_ID, time: Date.now()};
+      var localMsg = {id: data.msg_id, type: "text", data: text, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
       seenMsgs.add(localMsg.id);
       appendMessage(localMsg, true);
     }).catch(function() {
@@ -714,10 +1057,32 @@ PC_HTML = r"""<!DOCTYPE html>
     textInput.style.height = "";
   };
 
-  window.pickImage = function() { fileInput.click(); };
-  window.pickFile = function() { docInput.click(); };
-  fileInput.onchange = function() {
-    for (var i = 0; i < fileInput.files.length; i++) {
+  // --- 附件菜单 ---
+  window.toggleAttachMenu = function() {
+    var show = !attachMenu.classList.contains("show");
+    attachMenu.classList.toggle("show", show);
+    attachBackdrop.classList.toggle("show", show);
+    btnAttach.classList.toggle("active", show);
+  };
+  window.pickFile = function(type) {
+    var inputMap = {img: imgInput, audio: audioInput, video: videoInput, doc: docInput, other: otherInput};
+    var input = inputMap[type];
+    if (input) input.click();
+    // 关闭菜单
+    attachMenu.classList.remove("show");
+    attachBackdrop.classList.remove("show");
+    btnAttach.classList.remove("active");
+  };
+  // 点击菜单外关闭（backdrop 已处理 onclick=toggleAttachMenu）
+
+  // 图片 input — 作为图片消息发送（base64 data URI）
+  imgInput.onchange = function() {
+    if (currentDeviceCount === 0) {
+      showToast("暂无设备连接，无法发送", true);
+      imgInput.value = "";
+      return;
+    }
+    for (var i = 0; i < imgInput.files.length; i++) {
       (function(file) {
         var reader = new FileReader();
         reader.onload = function() {
@@ -725,12 +1090,11 @@ PC_HTML = r"""<!DOCTYPE html>
           fetch("/send", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({image: imgDataUri, sender: SENDER, device_name: MY_NAME, device_id: MY_ID})
+            body: JSON.stringify({image: imgDataUri, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
           }).then(function(r) { return r.json(); }).then(function(data) {
             if (!data.ok) throw new Error("发送失败");
-            // 本地立即显示
             var path = "/img/" + data.msg_id;
-            var localMsg = {id: data.msg_id, type: "image", data: path, sender: SENDER, sender_name: "我", device_id: MY_ID, time: Date.now()};
+            var localMsg = {id: data.msg_id, type: "image", data: path, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
             seenMsgs.add(localMsg.id);
             appendMessage(localMsg, true);
           }).catch(function() {
@@ -738,41 +1102,72 @@ PC_HTML = r"""<!DOCTYPE html>
           });
         };
         reader.readAsDataURL(file);
-      })(fileInput.files[i]);
+      })(imgInput.files[i]);
     }
-    fileInput.value = "";
+    imgInput.value = "";
   };
-  docInput.onchange = function() {
-    for (var i = 0; i < docInput.files.length; i++) {
-      (function(file) {
-        var reader = new FileReader();
-        reader.onload = function() {
-          var fb64 = reader.result.split(",")[1] || reader.result;
-          var fileInfo = {name: file.name, size: file.size, mime: file.type || "application/octet-stream", data: fb64};
-          fetch("/send", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({file: fileInfo, sender: SENDER, device_name: MY_NAME, device_id: MY_ID})
-          }).then(function(r) { return r.json(); }).then(function(data) {
-            if (!data.ok) throw new Error("发送失败");
-            var localMsg = {id: data.msg_id, type: "file", data: {name: file.name, size: file.size, path: "/file/" + data.msg_id}, sender: SENDER, sender_name: "我", device_id: MY_ID, time: Date.now()};
-            seenMsgs.add(localMsg.id);
-            appendMessage(localMsg, true);
-            showToast("文件已发送");
-          }).catch(function() {
-            showToast("文件过大或发送失败", true);
-          });
-        };
-        reader.readAsDataURL(file);
-      })(docInput.files[i]);
-    }
-    docInput.value = "";
-  };
+
+  // 通用文件发送处理器
+  function setupFileInput(input) {
+    input.onchange = function() {
+      if (currentDeviceCount === 0) {
+        showToast("暂无设备连接，无法发送", true);
+        input.value = "";
+        return;
+      }
+      for (var i = 0; i < input.files.length; i++) {
+        (function(file) {
+          var reader = new FileReader();
+          reader.onload = function() {
+            var fb64 = reader.result.split(",")[1] || reader.result;
+            var fileInfo = {name: file.name, size: file.size, mime: file.type || "application/octet-stream", data: fb64};
+            fetch("/send", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({file: fileInfo, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
+            }).then(function(r) { return r.json(); }).then(function(data) {
+              if (!data.ok) throw new Error("发送失败");
+              var localMsg = {id: data.msg_id, type: "file", data: {name: file.name, size: file.size, path: "/file/" + data.msg_id}, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
+              seenMsgs.add(localMsg.id);
+              appendMessage(localMsg, true);
+              showToast("文件已发送");
+            }).catch(function() {
+              showToast("文件过大或发送失败", true);
+            });
+          };
+          reader.readAsDataURL(file);
+        })(input.files[i]);
+      }
+      input.value = "";
+    };
+  }
+  setupFileInput(audioInput);
+  setupFileInput(videoInput);
+  setupFileInput(docInput);
+  setupFileInput(otherInput);
 })();
 </script>
 </body>
 </html>
 """
+
+# 用 SVG 图标替换所有占位符
+PC_HTML = (PC_HTML
+    .replace("__ICON_SEND__", SVG["send"])
+    .replace("__ICON_IMAGE__", SVG["image"])
+    .replace("__ICON_FILE__", SVG["file"])
+    .replace("__ICON_MOON__", SVG["moon"])
+    .replace("__ICON_SUN__", SVG["sun"])
+    .replace("__ICON_MONITOR__", SVG["monitor"])
+    .replace("__ICON_PHONE__", SVG["phone"])
+    .replace("__ICON_GLOBE__", SVG["globe"])
+    .replace("__ICON_WARN__", SVG["warn"])
+    .replace("__ICON_SIGNAL__", SVG["signal"])
+    .replace("__ICON_PLUS__", SVG["plus"])
+    .replace("__ICON_MUSIC__", SVG["music"])
+    .replace("__ICON_VIDEO__", SVG["video"])
+    .replace("__ICON_DOC__", SVG["doc"])
+)
 
 # --- 手机端 HTML ---
 MOBILE_HTML = r"""<!DOCTYPE html>
@@ -804,9 +1199,9 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   .dot.green{background:#10b981;box-shadow:0 0 5px rgba(16,185,129,.4)}
   .dot.red{background:#ef4444}
   .messages{flex:1;overflow-y:auto;padding:10px 14px;display:flex;flex-direction:column;gap:8px;background:var(--c-bg)}
-  .msg{max-width:80%;padding:10px 14px;border-radius:12px;font-size:15px;line-height:1.6;word-break:break-word;animation:fadeIn .3s}
+  .msg{max-width:80%;padding:10px 14px;border-radius:12px;font-size:15px;line-height:1.6;word-break:break-word;animation:fadeIn .3s;background:var(--c-msg-other);color:var(--c-text)}
   .msg.mobile{align-self:flex-end;background:var(--c-msg-self);color:#1b5e20;border-bottom-right-radius:4px}
-  [data-theme="dark"] .msg.mobile{color:#6ee7b7}
+  [data-theme="dark"] .msg.mobile{color:#6ee7b7;background:#134e4a}
   .msg.pc{align-self:flex-start;background:var(--c-msg-other);color:var(--c-text);border-bottom-left-radius:4px}
   .msg img{max-width:200px;max-height:200px;border-radius:8px;cursor:pointer;display:block;margin-top:4px}
   .msg .meta{font-size:10px;opacity:.5;margin-top:4px}
@@ -815,29 +1210,60 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   .input-area input[type=text]{flex:1;border:1.5px solid var(--c-border);border-radius:20px;padding:10px 16px;font-size:15px;outline:none;font-family:inherit;background:var(--c-input-bg);color:var(--c-text)}
   .input-area input[type=text]:focus{border-color:var(--c-pri)}
   .input-area button{width:40px;height:40px;border:none;background:var(--c-pri);color:#fff;border-radius:50%;cursor:pointer;font-size:18px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
-  .input-area .btn-img{background:#64748b}
-  #fileInput{display:none}
+  .input-area .btn-attach{background:#64748b;position:relative}
+  .input-area .btn-attach.active{background:var(--c-pri)}
+  /* 附件弹出菜单 */
+  .attach-backdrop{position:fixed;top:0;left:0;width:100%;height:100%;z-index:80;display:none}
+  .attach-backdrop.show{display:block}
+  .attach-menu{position:fixed;bottom:70px;left:12px;right:12px;max-width:280px;background:var(--c-surface);border:1px solid var(--c-border);border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.15);z-index:90;overflow:hidden;display:none}
+  .attach-menu.show{display:block;animation:menuIn .15s ease}
+  @keyframes menuIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+  .attach-menu .menu-item{display:flex;align-items:center;gap:12px;padding:12px 18px;cursor:pointer;font-size:15px;color:var(--c-text);transition:background .15s}
+  .attach-menu .menu-item:active{background:var(--c-primary-light);color:var(--c-primary)}
+  .attach-menu .menu-item .mi-icon{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+  .attach-menu .menu-item .mi-icon.img{background:#e8f5e9;color:#43a047}
+  .attach-menu .menu-item .mi-icon.audio{background:#fff3e0;color:#ef6c00}
+  .attach-menu .menu-item .mi-icon.video{background:#fce4ec;color:#e91e63}
+  .attach-menu .menu-item .mi-icon.doc{background:#e3f2fd;color:#1e88e5}
+  .attach-menu .menu-item .mi-icon.other{background:#f3e5f5;color:#8e24aa}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.img{background:#1b5e20;color:#81c784}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.audio{background:#4e342e;color:#ffb74d}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.video{background:#880e4f;color:#f48fb1}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.doc{background:#0d47a1;color:#90caf9}
+  [data-theme="dark"] .attach-menu .menu-item .mi-icon.other{background:#4a148c;color:#ce93d8}
   .empty-state{flex:1;display:flex;align-items:center;justify-content:center;color:var(--c-text3);font-size:15px;flex-direction:column;gap:8px}
   .toast{position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,.85);color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;z-index:100;opacity:0;transition:opacity .3s}
   .toast.show{opacity:1}
 </style>
 </head>
 <body>
-<div class="header">飞递 Feidi<button class="theme-btn" id="themeBtn" onclick="toggleTheme()">&#x263E;</button><div class="sub">手机端</div></div>
+<div class="header">飞递 Feidi<button class="theme-btn" id="themeBtn" onclick="toggleTheme()">__ICON_MOON__</button><div class="sub">手机端</div></div>
 <div class="status-bar connected" id="statusBar">
   <span class="dot green"></span><span>已连接</span>
 </div>
 <div class="messages" id="messages">
-  <div class="empty-state" id="emptyState">
-    <div style="font-size:48px">&#x2709;</div>
-    <div>发送第一条消息吧</div>
+    <div class="empty-state" id="emptyState">
+      __ICON_MAIL__
+      <div>发送第一条消息吧</div>
   </div>
 </div>
 <div class="input-area">
-  <input type="file" id="fileInput" accept="image/*" capture="environment">
-  <button class="btn-img" onclick="pickImage()" title="拍照/图片">&#x1F4F7;</button>
+  <input type="file" id="imgInput" accept="image/*" multiple style="display:none">
+  <input type="file" id="audioInput" accept="audio/*" multiple style="display:none">
+  <input type="file" id="videoInput" accept="video/*" multiple style="display:none">
+  <input type="file" id="docInput" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.wps,.et,.dps,.csv,.rtf,.odt,.ods,.odp,.md" multiple style="display:none">
+  <input type="file" id="otherInput" multiple style="display:none">
+  <button class="btn-attach" id="btnAttach" onclick="toggleAttachMenu()" title="添加附件">__ICON_PLUS__</button>
   <input type="text" id="textInput" placeholder="输入文字..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendText()}">
-  <button onclick="sendText()" title="发送">&#10148;</button>
+  <button onclick="sendText()" title="发送">__ICON_SEND__</button>
+</div>
+<div class="attach-backdrop" id="attachBackdrop" onclick="toggleAttachMenu()"></div>
+<div class="attach-menu" id="attachMenu">
+  <div class="menu-item" onclick="pickFile('img')"><span class="mi-icon img">__ICON_IMAGE__</span>图片</div>
+  <div class="menu-item" onclick="pickFile('audio')"><span class="mi-icon audio">__ICON_MUSIC__</span>音频</div>
+  <div class="menu-item" onclick="pickFile('video')"><span class="mi-icon video">__ICON_VIDEO__</span>视频</div>
+  <div class="menu-item" onclick="pickFile('doc')"><span class="mi-icon doc">__ICON_DOC__</span>文档</div>
+  <div class="menu-item" onclick="pickFile('other')"><span class="mi-icon other">__ICON_FILE__</span>其他文件</div>
 </div>
 <div class="toast" id="toast"></div>
 <div class="login-overlay" id="loginOverlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:200;display:none;align-items:center;justify-content:center">
@@ -856,7 +1282,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   var btn = document.getElementById("themeBtn");
   function setTheme(t) {
     document.documentElement.setAttribute("data-theme", t);
-    if (btn) { btn.innerHTML = t === "dark" ? "&#x2600;" : "&#x263E;"; }
+    if (btn) { btn.innerHTML = t === "dark" ? '__ICON_SUN__' : '__ICON_MOON__'; }
     try { localStorage.setItem(KEY, t); } catch(e) {}
   }
   var saved; try { saved = localStorage.getItem(KEY); } catch(e) {}
@@ -870,8 +1296,21 @@ MOBILE_HTML = r"""<!DOCTYPE html>
 (function(){
   const SENDER = "mobile";
 
+  // --- 身份与持久化 ---
+  var PERSISTENT_ID = "";
+  try { PERSISTENT_ID = localStorage.getItem("feidi_pid"); } catch(e) {}
+  if (!PERSISTENT_ID) {
+    PERSISTENT_ID = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
+      var r = Math.random() * 16 | 0, v = c === "x" ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+    try { localStorage.setItem("feidi_pid", PERSISTENT_ID); } catch(e) {}
+  }
+  var MY_DISPLAY_NAME = "";
+  try { MY_DISPLAY_NAME = localStorage.getItem("feidi_myname") || ""; } catch(e) {}
+
   const seenMsgs = new Set();
-  const evtSource = new EventSource("/events?type=mobile&name=" + encodeURIComponent("手机"));
+  const evtSource = new EventSource("/events?type=mobile&pid=" + encodeURIComponent(PERSISTENT_ID) + "&name=" + encodeURIComponent("手机") + (MY_DISPLAY_NAME ? "&my_name=" + encodeURIComponent(MY_DISPLAY_NAME) : ""));
   evtSource.addEventListener("history", function(e) {
     const msgs = JSON.parse(e.data);
     msgs.forEach(function(m) {
@@ -904,7 +1343,14 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   const msgContainer = document.getElementById("messages");
   let emptyState = document.getElementById("emptyState");
   const textInput = document.getElementById("textInput");
-  const fileInput = document.getElementById("fileInput");
+  const imgInput = document.getElementById("imgInput");
+  const audioInput = document.getElementById("audioInput");
+  const videoInput = document.getElementById("videoInput");
+  const docInput = document.getElementById("docInput");
+  const otherInput = document.getElementById("otherInput");
+  const btnAttach = document.getElementById("btnAttach");
+  const attachMenu = document.getElementById("attachMenu");
+  const attachBackdrop = document.getElementById("attachBackdrop");
   const toast = document.getElementById("toast");
   const loginOverlay = document.getElementById("loginOverlay");
   const passwordInput = document.getElementById("passwordInput");
@@ -965,9 +1411,25 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     textInput.value = "";
   };
 
-  window.pickImage = function() { fileInput.click(); };
-  fileInput.onchange = function() {
-    for (var i = 0; i < fileInput.files.length; i++) {
+  // --- 附件菜单 ---
+  window.toggleAttachMenu = function() {
+    var show = !attachMenu.classList.contains("show");
+    attachMenu.classList.toggle("show", show);
+    attachBackdrop.classList.toggle("show", show);
+    btnAttach.classList.toggle("active", show);
+  };
+  window.pickFile = function(type) {
+    var inputMap = {img: imgInput, audio: audioInput, video: videoInput, doc: docInput, other: otherInput};
+    var input = inputMap[type];
+    if (input) input.click();
+    attachMenu.classList.remove("show");
+    attachBackdrop.classList.remove("show");
+    btnAttach.classList.remove("active");
+  };
+
+  // 图片 — 作为图片消息发送
+  imgInput.onchange = function() {
+    for (var i = 0; i < imgInput.files.length; i++) {
       (function(file) {
         const reader = new FileReader();
         reader.onload = function() {
@@ -980,16 +1442,58 @@ MOBILE_HTML = r"""<!DOCTYPE html>
           });
         };
         reader.readAsDataURL(file);
-      })(fileInput.files[i]);
+      })(imgInput.files[i]);
     }
-    fileInput.value = "";
+    imgInput.value = "";
   };
+
+  // 通用文件发送
+  function setupFileInput(input) {
+    input.onchange = function() {
+      for (var i = 0; i < input.files.length; i++) {
+        (function(file) {
+          const reader = new FileReader();
+          reader.onload = function() {
+            var fb64 = reader.result.split(",")[1] || reader.result;
+            var fileInfo = {name: file.name, size: file.size, mime: file.type || "application/octet-stream", data: fb64};
+            fetch("/send", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({file: fileInfo, sender: SENDER})
+            }).then(function(r) {
+              if (!r.ok) showToast("文件过大，请压缩后重试");
+            });
+          };
+          reader.readAsDataURL(file);
+        })(input.files[i]);
+      }
+      input.value = "";
+    };
+  }
+  setupFileInput(audioInput);
+  setupFileInput(videoInput);
+  setupFileInput(docInput);
+  setupFileInput(otherInput);
 })();
 </script>
 </body>
 </html>
 """
 
+# 用 SVG 图标替换所有占位符
+MOBILE_HTML = (MOBILE_HTML
+    .replace("__ICON_SEND__", SVG["send"])
+    .replace("__ICON_CAMERA__", SVG["camera"])
+    .replace("__ICON_MOON__", SVG["moon"])
+    .replace("__ICON_SUN__", SVG["sun"])
+    .replace("__ICON_MAIL__", SVG["mail"])
+    .replace("__ICON_PLUS__", SVG["plus"])
+    .replace("__ICON_IMAGE__", SVG["image"])
+    .replace("__ICON_FILE__", SVG["file"])
+    .replace("__ICON_MUSIC__", SVG["music"])
+    .replace("__ICON_VIDEO__", SVG["video"])
+    .replace("__ICON_DOC__", SVG["doc"])
+)
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """支持多线程的 HTTP 服务器，每个请求在独立线程中处理。"""
@@ -1070,8 +1574,43 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not self.check_password():
             self.send_error_body(403, "Forbidden: wrong password")
             return
-            # 图片消息的 data 是 /img/{id}，前端直接用此 URL
-            self.send_json(200, messages)
+
+        if path.startswith("/rename"):
+            params = parse_qs(parsed.query)
+            dev_id = params.get("id", [""])[0]
+            new_name = params.get("name", [""])[0]
+            if not dev_id or not new_name:
+                self.send_error_body(400, "Missing id or name")
+                return
+            new_name = new_name.strip()[:20]
+            if not new_name:
+                self.send_error_body(400, "Name cannot be empty")
+                return
+
+            # 验证：只能改自己的名字（通过 IP 匹配）
+            client_ip = self.client_address[0]
+            renamed = False
+            with _sse_lock:
+                for c in sse_clients:
+                    if c.get("device_id") == dev_id:
+                        c["name"] = new_name
+                        renamed = True
+                        break
+            if not renamed:
+                self.send_error_body(404, "Device not found")
+                return
+
+            # 持久化到 identity_map
+            for ikey, info in identity_map.items():
+                if info.get("device_id") == dev_id:
+                    info["name"] = new_name
+                    break
+            save_identities()
+            broadcast_device_list()
+            self.send_json(200, {"ok": True, "name": new_name})
+
+        elif path == "/status":
+            self.send_json(200, {"connections": len(sse_clients), "messages": len(messages)})
 
         elif path.startswith("/img/"):
             # 服务图片二进制文件（仅允许 UUID 格式，防路径穿越）
@@ -1134,8 +1673,53 @@ class RequestHandler(BaseHTTPRequestHandler):
             dev_name = params.get("name", [dev_type])[0]
             if dev_type not in ("pc", "mobile"):
                 dev_type = "unknown"
-            device_id = str(uuid.uuid4())[:8]
-            dev_info = {"queue": queue.Queue(), "device_id": device_id, "name": dev_name, "type": dev_type}
+
+            # 身份绑定：客户端传入 persistent_id 做身份 key
+            client_ip = self.client_address[0]
+            pid = params.get("pid", [""])[0]
+            my_name = params.get("my_name", [""])[0].strip()[:20]
+
+            if pid:
+                identity_key = pid
+            else:
+                # 兼容旧客户端：用 IP 做 fallback
+                identity_key = f"{client_ip}_{dev_type}"
+
+            # 查找或创建身份
+            if identity_key in identity_map:
+                info = identity_map[identity_key]
+                device_id = info["device_id"]
+                if my_name:
+                    dev_name = my_name
+                    info["name"] = my_name
+                else:
+                    dev_name = info.get("name", dev_name or dev_type)
+                # 更新元数据
+                info["last_ip"] = client_ip
+                info["last_seen"] = int(time.time())
+                info["type"] = dev_type
+                # 尝试获取 MAC（如果是新 IP）
+                if info.get("last_ip") != client_ip and client_ip not in ("127.0.0.1", "::1"):
+                    mac = get_mac(client_ip)
+                    if mac:
+                        info["mac"] = mac
+            else:
+                device_id = str(uuid.uuid4())[:8]
+                dev_name = my_name or dev_name or dev_type
+                mac = get_mac(client_ip) if client_ip not in ("127.0.0.1", "::1") else None
+                identity_map[identity_key] = {
+                    "device_id": device_id,
+                    "name": dev_name,
+                    "hostname": dev_name,
+                    "last_ip": client_ip,
+                    "mac": mac,
+                    "type": dev_type,
+                    "first_seen": int(time.time()),
+                    "last_seen": int(time.time()),
+                }
+            save_identities()
+
+            dev_info = {"queue": queue.Queue(), "device_id": device_id, "name": dev_name, "type": dev_type, "identity_key": identity_key}
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -1151,7 +1735,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             # 发送设备身份和消息历史
             try:
-                self.wfile.write(f"event: device_id\ndata: {json.dumps({'device_id': device_id, 'name': dev_name, 'type': dev_type}, ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.write(f"event: device_id\ndata: {json.dumps({'device_id': device_id, 'name': dev_name, 'type': dev_type, 'server_hostname': _server_hostname, 'identity_key': identity_key}, ensure_ascii=False)}\n\n".encode("utf-8"))
                 self.wfile.flush()
                 history = json.dumps(messages, ensure_ascii=False)
                 self.wfile.write(f"event: history\ndata: {history}\n\n".encode("utf-8"))
@@ -1232,13 +1816,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 sender = "unknown"
             dev_name = data.get("device_name", "")
             dev_id = data.get("device_id", "")
+            target_id = data.get("target_id", None)  # None = 广播, str = 私聊目标
 
             if "text" in data and data["text"]:
                 text = data["text"]
                 if len(text) > 10000:
                     self.send_error_body(413, "Text too long (max 10000 chars)")
                     return
-                msg_id = add_message("text", text, sender, dev_name, dev_id)
+                msg_id = add_message("text", text, sender, dev_name, dev_id, target_id)
             elif "image" in data and data["image"]:
                 img_data = data["image"]
                 if len(img_data) > 5 * 1024 * 1024:
@@ -1247,7 +1832,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not img_data.startswith("data:image/"):
                     self.send_error_body(400, "Only data:image/... URIs accepted")
                     return
-                msg_id = add_message("image", img_data, sender, dev_name, dev_id)
+                msg_id = add_message("image", img_data, sender, dev_name, dev_id, target_id)
             elif "file" in data and data["file"]:
                 file_data = data["file"]
                 if not isinstance(file_data, dict):
@@ -1257,7 +1842,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if fsize > 50 * 1024 * 1024:
                     self.send_error_body(413, "File too large (max 50MB)")
                     return
-                msg_id = add_message("file", file_data, sender, dev_name, dev_id)
+                msg_id = add_message("file", file_data, sender, dev_name, dev_id, target_id)
             else:
                 self.send_error_body(400, "No text, image or file")
                 return

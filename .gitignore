@@ -8,3 +8,4 @@ transfer_v1_backup.py
 build_v1_backup.spec
 feidi_build/
 article_*.md
+feidi_identities.json
