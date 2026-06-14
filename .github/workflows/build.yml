@@ -33,3 +33,29 @@ jobs:
         with:
           name: Feidi-macos
           path: dist/Feidi-macos
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Feidi-win
+      - uses: actions/download-artifact@v4
+        with:
+          name: Feidi-macos
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: 最新构建
+          body: |
+            自动构建于 ${{ github.sha }}
+
+            | 平台 | 文件 |
+            |------|------|
+            | Windows | `Feidi-win.exe` |
+            | macOS | `Feidi-macos` |
+          files: |
+            Feidi-win.exe
+            Feidi-macos
+          prerelease: true
