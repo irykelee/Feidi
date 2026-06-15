@@ -28,357 +28,68 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
-# --- 纯 Python QR 码生成器（零外部依赖） ---
+# --- QR 码生成（基于 qrcode 库，纯 Python） ---
 
-# GF(256) 运算表（Reed-Solomon 纠错编码用）
-_GF_EXP = [0] * 512
-_GF_LOG = [0] * 256
-_x = 1
-for _i in range(255):
-    _GF_EXP[_i] = _x
-    _GF_LOG[_x] = _i
-    _x <<= 1
-    if _x & 0x100:
-        _x ^= 0x11D
-for _i in range(255, 512):
-    _GF_EXP[_i] = _GF_EXP[_i - 255]
-
-def _gf_mul(a, b):
-    if a == 0 or b == 0:
-        return 0
-    return _GF_EXP[_GF_LOG[a] + _GF_LOG[b]]
-
-def _gf_poly_mul(p, q):
-    r = [0] * (len(p) + len(q) - 1)
-    for i, pi in enumerate(p):
-        for j, qj in enumerate(q):
-            r[i + j] ^= _gf_mul(pi, qj)
-    return r
-
-def _rs_generator(nsym):
-    g = [1]
-    for i in range(nsym):
-        g = _gf_poly_mul(g, [1, _GF_EXP[i]])
-    return g
-
-def _rs_encode(msg_in, nsym):
-    """Reed-Solomon 编码，返回 nsym 个纠错码字"""
-    gen = _rs_generator(nsym)
-    msg = msg_in + [0] * nsym
-    for i in range(len(msg_in)):
-        coef = msg[i]
-        if coef != 0:
-            for j in range(len(gen)):
-                msg[i + j] ^= _gf_mul(gen[j], coef)
-    return msg[-nsym:]
-
-# 字母数字编码表
-_ALPHANUMERIC = {}
-for _i, _ch in enumerate("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"):
-    _ALPHANUMERIC[_ch] = _i
-
-# 各版本 / EC 级别对应的数据码字容量（EC 级别 L/M/Q/H → 版本 1-10）
-_CAPACITY = {
-    # L:   [v1,v2,v3,v4, v5, v6, v7, v8, v9,v10]
-    "L": [19,34,55,80,108,136,156,194,232,274],
-    "M": [16,28,44,64, 86,108,124,154,182,216],
-    "Q": [13,22,34,48, 62, 76, 88,110,132,154],
-    "H": [ 9,16,26,36, 46, 60, 66, 86,100,122],
-}
-# 各版本的纠错块结构 (EC 码字数, 每块数据码字数, 块数)
-_EC_BLOCKS = {
-    # v1
-    "L": [(7, 19, 1)], "M": [(10, 16, 1)], "Q": [(13, 13, 1)], "H": [(17, 9, 1)],
-    # v2
-    2: {"L": [(10, 34, 1)], "M": [(16, 28, 1)], "Q": [(22, 22, 1)], "H": [(28, 16, 1)]},
-    # v3
-    3: {"L": [(15, 55, 1)], "M": [(26, 44, 1)], "Q": [(18, 17, 2)], "H": [(22, 13, 2)]},
-    # v4
-    4: {"L": [(20, 80, 1)], "M": [(18, 32, 2)], "Q": [(26, 24, 2)], "H": [(16, 9, 4)]},
-    # v5
-    5: {"L": [(26, 108, 1)], "M": [(24, 43, 2)], "Q": [(18, 15, 2), (18, 16, 2)], "H": [(22, 11, 2), (22, 12, 2)]},
-    # v6
-    6: {"L": [(18, 68, 2)], "M": [(16, 27, 4)], "Q": [(24, 19, 4)], "H": [(28, 15, 4)]},
-    # v7
-    7: {"L": [(20, 78, 2)], "M": [(18, 31, 4)], "Q": [(18, 14, 2), (18, 15, 4)], "H": [(26, 13, 4), (26, 14, 1)]},
-    # v8
-    8: {"L": [(24, 97, 2)], "M": [(22, 38, 2), (22, 39, 2)], "Q": [(22, 18, 4), (22, 19, 2)], "H": [(26, 14, 4), (26, 15, 2)]},
-    # v9
-    9: {"L": [(30, 116, 2)], "M": [(22, 36, 3), (22, 37, 2)], "Q": [(20, 16, 4), (20, 17, 4)], "H": [(24, 12, 4), (24, 13, 4)]},
-    # v10
-    10: {"L": [(18, 68, 2), (18, 69, 2)], "M": [(26, 43, 4), (26, 44, 1)], "Q": [(24, 19, 6), (24, 20, 2)], "H": [(28, 15, 6), (28, 16, 2)]},
-}
-# 对齐图案位置（版本 2-10）
-_ALIGNMENT = {
-    2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
-    6: [6, 34], 7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50],
-}
-# 格式信息（EC_M_Q 的 8 种组合 × 8 个 mask）
-_FORMAT_INFO = [
-    0x5412,0x5125,0x5E7C,0x5B4B,0x45F9,0x40CE,0x4F97,0x4AA0,
-    0x77C4,0x72F3,0x7DAA,0x789D,0x662F,0x6318,0x6C41,0x6976,
-    0x1689,0x13BE,0x1CE7,0x19D0,0x0762,0x0255,0x0D0C,0x083B,
-    0x355F,0x3068,0x3F31,0x3A06,0x24B4,0x2183,0x2EDA,0x2BED,
-]
-_EC_LEVELS = {"L": 0, "M": 1, "Q": 2, "H": 3}
+# 尝试加载 qrcode 库
+_qrcode_lib = None
+_qrcode_path_vendor = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qrcode_lib')
+try:
+    import qrcode as _qrlib
+    _qrcode_lib = _qrlib
+except ImportError:
+    if os.path.isdir(_qrcode_path_vendor):
+        sys.path.insert(0, _qrcode_path_vendor)
+        try:
+            import qrcode as _qrlib
+            _qrcode_lib = _qrlib
+        except ImportError:
+            pass
 
 
-def _generate_qr_modules(data_str, ec="M"):
-    """生成 QR 码的 2D 模块矩阵（True=黑, False=白）。返回 (modules, version)"""
-    # 1. 选版本
-    data_len = len(data_str)
-    version = None
-    for v in range(1, 11):
-        cap = _CAPACITY[ec][v - 1]
-        vdata = v
-        # 估算比特数：字母数字模式 4位模式指示 + 字符计数 + 每个字符对11位
-        ch_count_bits = 9 if v <= 9 else 11
-        total_bits = 4 + ch_count_bits + (data_len // 2) * 11 + (data_len % 2) * 6
-        total_bytes = (total_bits + 7) // 8
-        if total_bytes <= cap:
-            version = vdata
-            break
-    if version is None:
-        version = 10  # 最大版本兜底
+def _get_qr_modules(data, ec="M"):
+    """使用 qrcode 库生成 QR 模块矩阵."""
+    ec_map = {"L": _qrlib.constants.ERROR_CORRECT_L, "M": _qrlib.constants.ERROR_CORRECT_M,
+              "Q": _qrlib.constants.ERROR_CORRECT_Q, "H": _qrlib.constants.ERROR_CORRECT_H}
+    qr = _qrlib.QRCode(box_size=1, border=0, error_correction=ec_map.get(ec, _qrlib.constants.ERROR_CORRECT_M))
+    qr.add_data(data)
+    qr.make(fit=True)
+    return qr.modules
 
-    # 2. 编码数据
-    bits = []
-    # 模式指示符：0010（字母数字）
-    bits.extend([0, 0, 1, 0])
-    # 字符计数
-    count_bits = 9 if version <= 9 else 11
-    for i in range(count_bits - 1, -1, -1):
-        bits.append((data_len >> i) & 1)
-    # 字符编码（成对）
-    chars = list(data_str)
-    i = 0
-    while i < len(chars):
-        if i + 1 < len(chars):
-            v = _ALPHANUMERIC.get(chars[i].upper(), 0) * 45 + _ALPHANUMERIC.get(chars[i + 1].upper(), 0)
-            for j in range(10, -1, -1):
-                bits.append((v >> j) & 1)
-            i += 2
-        else:
-            v = _ALPHANUMERIC.get(chars[i].upper(), 0)
-            for j in range(5, -1, -1):
-                bits.append((v >> j) & 1)
-            i += 1
-    # 终止符（最多 4 个 0）
-    total_codewords = _CAPACITY[ec][version - 1]
-    needed_bits = total_codewords * 8
-    term_len = min(4, needed_bits - len(bits))
-    bits.extend([0] * term_len)
-    # 补 0 到字节边界
-    while len(bits) % 8 != 0:
-        bits.append(0)
-    # 填充字节
-    pad_bytes = [0xEC, 0x11]
-    pi = 0
-    while len(bits) < needed_bits:
-        pb = pad_bytes[pi % 2]
-        for j in range(7, -1, -1):
-            bits.append((pb >> j) & 1)
-        pi += 1
-    # 截断到所需长度
-    bits = bits[:needed_bits]
 
-    # 3. 字节分组和纠错编码
-    data_bytes = []
-    for bi in range(0, len(bits), 8):
-        byte = 0
-        for j in range(8):
-            if bi + j < len(bits):
-                byte = (byte << 1) | bits[bi + j]
-        data_bytes.append(byte)
-
-    blocks_spec = _EC_BLOCKS.get(version, _EC_BLOCKS)[ec]
-    all_blocks = []
-    ec_blocks = []
-    ptr = 0
-    for nsym, ndata, nblocks in blocks_spec:
-        for _ in range(nblocks):
-            block_data = data_bytes[ptr:ptr + ndata]
-            ptr += ndata
-            all_blocks.append(block_data)
-            ec_blocks.append(_rs_encode(block_data, nsym))
-
-    # 交织排列
-    final = []
-    max_data = max(len(b) for b in all_blocks)
-    for i in range(max_data):
-        for b in all_blocks:
-            if i < len(b):
-                final.append(b[i])
-    max_ec = max(len(e) for e in ec_blocks)
-    for i in range(max_ec):
-        for e in ec_blocks:
-            if i < len(e):
-                final.append(e[i])
-
-    # 4. 构建矩阵
-    size = 17 + version * 4
-    matrix = [[None] * size for _ in range(size)]
-
-    # 放置定位图案（3 个角）
-    for (r, c) in [(0, 0), (0, size - 7), (size - 7, 0)]:
-        for i in range(7):
-            for j in range(7):
-                matrix[r + i][c + j] = (i in (0, 6) or j in (0, 6) or (2 <= i <= 4 and 2 <= j <= 4))
-    # 分隔符
-    for (r, c) in [(0, 0), (0, size - 8), (size - 8, 0)]:
-        for i in range(8):
-            if r + i < size and c + 7 < size:
-                matrix[r + i][c + 7] = False
-            if r + 7 < size and c + i < size:
-                matrix[r + 7][c + i] = False
-    # 对齐图案
-    if version >= 2:
-        align = _ALIGNMENT.get(version, [])
-        for ar in align:
-            for ac in align:
-                if matrix[ar][ac] is not None:
-                    continue  # 不与定位图案重叠
-                for i in range(-2, 3):
-                    for j in range(-2, 3):
-                        r, c = ar + i, ac + j
-                        if 0 <= r < size and 0 <= c < size and matrix[r][c] is None:
-                            matrix[r][c] = i in (-2, 2) or j in (-2, 2)
-    # 时序图案
-    for i in range(8, size - 8):
-        if matrix[6][i] is None:
-            matrix[6][i] = i % 2 == 0
-        if matrix[i][6] is None:
-            matrix[i][6] = i % 2 == 0
-    # 暗模块
-    matrix[size - 8][8] = True
-
-    # 预留格式信息区域（全部设 False 占位）
-    for i in range(9):
-        if matrix[i][8] is None:
-            matrix[i][8] = False
-        if matrix[8][i] is None:
-            matrix[8][i] = False
-    for i in range(8):
-        if matrix[size - 1 - i][8] is None:
-            matrix[size - 1 - i][8] = False
-        if matrix[8][size - 1 - i] is None:
-            matrix[8][size - 1 - i] = False
-
-    # 5. 放置数据位
-    data_bits = []
-    for b in final:
-        for j in range(7, -1, -1):
-            data_bits.append((b >> j) & 1)
-    col = size - 1
-    bit_idx = 0
-    going_up = True
-    while col > 0:
-        if col == 6:
-            col -= 1
-        for r in (range(size - 1, -1, -1) if going_up else range(size)):
-            for c in (col, col - 1):
-                if matrix[r][c] is None and bit_idx < len(data_bits):
-                    matrix[r][c] = bool(data_bits[bit_idx])
-                    bit_idx += 1
-        col -= 2
-        going_up = not going_up
-
-    # 6. 选择最佳掩码
-    def _mask_value(matrix, mask_pattern):
-        size = len(matrix)
-        m = [row[:] for row in matrix]
+def generate_qr_svg(data, module_px=4, border=4):
+    """使用 qrcode 库生成 QR 码 SVG 字符串。库不可用时显示文本链接。"""
+    if _qrcode_lib is None:
+        return (
+            '<div style="padding:16px 8px;color:#c62828;font-size:13px;word-break:break-all;text-align:center">'
+            'QR 库未加载，请在手机浏览器访问:<br>'
+            '<b style="color:#2e7d32;font-size:14px">%s</b></div>' % data
+        )
+    try:
+        modules = _get_qr_modules(data)
+        size = len(modules)
+        total = (size + 2 * border) * module_px
+        margin = border * module_px
+        lines = [
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" '
+            'width="200" height="200" shape-rendering="crispEdges">' % (total, total),
+            '<rect width="%d" height="%d" fill="#ffffff"/>' % (total, total)
+        ]
         for r in range(size):
             for c in range(size):
-                if m[r][c] is not None:
-                    invert = False
-                    if mask_pattern == 0:
-                        invert = (r + c) % 2 == 0
-                    elif mask_pattern == 1:
-                        invert = r % 2 == 0
-                    elif mask_pattern == 2:
-                        invert = c % 3 == 0
-                    elif mask_pattern == 3:
-                        invert = (r + c) % 3 == 0
-                    elif mask_pattern == 4:
-                        invert = (r // 2 + c // 3) % 2 == 0
-                    elif mask_pattern == 5:
-                        invert = (r * c) % 2 + (r * c) % 3 == 0
-                    elif mask_pattern == 6:
-                        invert = ((r * c) % 2 + (r * c) % 3) % 2 == 0
-                    elif mask_pattern == 7:
-                        invert = ((r + c) % 2 + (r * c) % 3) % 2 == 0
-                    if invert:
-                        m[r][c] = not bool(m[r][c]) if m[r][c] is not None else True
-        return m
+                if modules[r][c]:
+                    lines.append(
+                        '<rect x="%d" y="%d" width="%d" height="%d" fill="#2e7d32"/>'
+                        % (margin + c * module_px, margin + r * module_px, module_px, module_px)
+                    )
+        lines.append('</svg>')
+        return '\n'.join(lines)
+    except Exception as e:
+        return (
+            '<div style="padding:16px 8px;color:#c62828;font-size:13px;text-align:center">'
+            'QR 生成失败: %s<br>请在手机浏览器访问:<br>'
+            '<b style="color:#2e7d32;font-size:14px">%s</b></div>' % (str(e), data)
+        )
 
-    def _score(m):
-        s = len(m)
-        penalty = 0
-        # 规则1：连续同色行/列
-        for r in range(s):
-            for c in range(s - 4):
-                v = m[r][c]
-                if v is not None and all(m[r][c + i] == v for i in range(5)):
-                    penalty += 3 + (1 if all(c + i < s and m[r][c + i] == v for i in range(5, min(8, s - c))) else 0)
-        for c in range(s):
-            for r in range(s - 4):
-                v = m[r][c]
-                if v is not None and all(m[r + i][c] == v for i in range(5)):
-                    penalty += 3 + (1 if all(r + i < s and m[r + i][c] == v for i in range(5, min(8, s - r))) else 0)
-        # 规则2：2x2 同色块
-        for r in range(s - 1):
-            for c in range(s - 1):
-                vals = [m[r][c], m[r][c+1], m[r+1][c], m[r+1][c+1]]
-                if None not in vals and len(set(vals)) == 1:
-                    penalty += 3
-        # 规则3：定位图案相似
-        for r in range(s):
-            for c in range(s - 10):
-                if m[r][c] is not None:
-                    pattern = [m[r][c+i] for i in range(11)]
-                    if pattern == [True,False,True,True,True,False,True,False,False,False,False]:
-                        penalty += 40
-        for c in range(s):
-            for r in range(s - 10):
-                if m[r][c] is not None:
-                    pattern = [m[r+i][c] for i in range(11)]
-                    if pattern == [True,False,True,True,True,False,True,False,False,False,False]:
-                        penalty += 40
-        # 规则4：黑白比例
-        total = sum(1 for row in m for v in row if v is not None)
-        if total == 0:
-            return penalty
-        dark = sum(1 for row in m for v in row if v)
-        ratio = dark * 100 // total
-        penalty += abs(ratio - 50) // 5 * 10
-        return penalty
-
-    best_mask = 0
-    best_score = float("inf")
-    best_matrix = None
-    for mp in range(8):
-        masked = _mask_value(matrix, mp)
-        sc = _score(masked)
-        if sc < best_score:
-            best_score = sc
-            best_mask = mp
-            best_matrix = masked
-
-    # 7. 填入格式信息
-    fmt = _FORMAT_INFO[_EC_LEVELS[ec] * 8 + best_mask]
-    fmt_bits = [(fmt >> (14 - i)) & 1 for i in range(15)]
-    coords = [(0,8),(1,8),(2,8),(3,8),(4,8),(5,8),(7,8),(8,8),(8,7),(8,5),(8,4),(8,3),(8,2),(8,1),(8,0)]
-    for idx, (r, c) in enumerate(coords):
-        if 0 <= r < size and 0 <= c < size:
-            best_matrix[r][c] = bool(fmt_bits[idx])
-    dark_coords = [(size-1,8),(size-2,8),(size-3,8),(size-4,8),(size-5,8),(size-6,8),(size-7,8),(size-8,8),
-                   (8,size-8),(8,size-7),(8,size-6),(8,size-5),(8,size-4),(8,size-3),(8,size-2),(8,size-1)]
-    for idx, (r, c) in enumerate(dark_coords):
-        if 0 <= r < size and 0 <= c < size:
-            if idx < len(fmt_bits):
-                best_matrix[r][c] = bool(fmt_bits[idx])
-
-    return best_matrix, version
 
 # --- 命令行参数 ---
 parser = argparse.ArgumentParser(description="飞递 Feidi — 局域网传输工具")
@@ -472,21 +183,67 @@ def _ensure_chunk_dir():
 
 
 def _cleanup_stale_chunks(force=False):
-    """清理过期分块（默认超过 10 分钟未完成的清理）"""
+    """清理过期分块（默认超过 10 分钟未完成的清理）。force=True 时不发通知（用于退出清理）。"""
     now = time.time()
-    timeout = 0 if force else 600  # force 时全清
+    timeout = 0 if force else 600
     dead = []
     for tid, ct in list(chunk_transfers.items()):
         if force or (now - ct.get("created", now)) > timeout:
-            dead.append(tid)
-    for tid in dead:
+            dead.append((tid, ct))
+    for tid, ct in dead:
         cp = os.path.join(CHUNK_DIR, tid)
         if os.path.isdir(cp):
             shutil.rmtree(cp, ignore_errors=True)
         chunk_transfers.pop(tid, None)
+        # 超时通知发送者和接收者
+        if not force:
+            fname = ct.get("info", {}).get("name", "未知文件") if isinstance(ct.get("info"), dict) else "未知文件"
+            fail_msg = json.dumps({
+                "transfer_id": tid, "filename": fname,
+                "error": "传输超时，对方可能已断开连接"
+            }, ensure_ascii=False)
+            broadcast_sse("transfer_timeout", fail_msg, target_id=ct.get("device_id", ""))
+            if ct.get("target_id"):
+                broadcast_sse("transfer_timeout", fail_msg, target_id=ct["target_id"])
 
 
 atexit.register(cleanup)
+
+
+def _cleanup_old_temp_files():
+    """清理超过 1 小时的临时文件（图片、文件消息的二进制数据）"""
+    now = time.time()
+    cutoff = now - 3600
+    try:
+        for fname in os.listdir(TEMP_DIR):
+            fp = os.path.join(TEMP_DIR, fname)
+            try:
+                if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _startup_cleanup():
+    """启动时清理上次运行残留的分块目录"""
+    if os.path.isdir(CHUNK_DIR):
+        for d in os.listdir(CHUNK_DIR):
+            dp = os.path.join(CHUNK_DIR, d)
+            if os.path.isdir(dp):
+                try:
+                    shutil.rmtree(dp, ignore_errors=True)
+                except OSError:
+                    pass
+
+
+def _periodic_cleanup_loop():
+    """定期清理线程：每 30 分钟清理过期的临时文件和分块"""
+    while True:
+        time.sleep(1800)  # 30 分钟
+        _cleanup_old_temp_files()
+        _cleanup_stale_chunks()
 
 
 def signal_handler(sig, frame):
@@ -629,16 +386,18 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
         if len(messages) > MAX_MESSAGES:
             old = messages.pop(0)
             _cleanup_msg_files(old["id"])
-    broadcast_sse("new_message", msg, exclude_device=device_id if not target_id and device_id else None, target_id=target_id)
-    return msg_id
+    target_ok = broadcast_sse("new_message", msg, exclude_device=device_id if not target_id and device_id else None, target_id=target_id)
+    # 返回 (msg_id, target_ok): target_ok 为 None 表示广播模式, True/False 表示私聊目标是否找到
+    return msg_id, target_ok if target_id else None
 
 
 def broadcast_sse(event, data, exclude_device=None, target_id=None):
     """向 SSE 客户端广播事件。
-    target_id: 仅发送给指定设备（私聊模式）
+    target_id: 仅发送给指定设备（私聊模式），返回 True/False 表示是否找到目标
     exclude_device: 排除指定设备（广播模式，排除发送者自身）
-    两者互斥，target_id 优先。"""
+    两者互斥，target_id 优先。返回: 若指定了 target_id 则返回是否找到目标，否则返回 None"""
     dead = []
+    found_target = False
     if isinstance(data, (dict, list)):
         json_data = json.dumps(data, ensure_ascii=False)
     elif isinstance(data, str):
@@ -651,6 +410,7 @@ def broadcast_sse(event, data, exclude_device=None, target_id=None):
             if target_id:
                 if cid != target_id:
                     continue
+                found_target = True
             elif exclude_device and cid == exclude_device:
                 continue
             try:
@@ -660,6 +420,7 @@ def broadcast_sse(event, data, exclude_device=None, target_id=None):
         for c in dead:
             if c in sse_clients:
                 sse_clients.remove(c)
+    return found_target if target_id else None
 
 
 def broadcast_device_list():
@@ -676,36 +437,6 @@ def broadcast_device_list():
         for c in dead:
             if c in sse_clients:
                 sse_clients.remove(c)
-
-
-# --- QR 码 SVG 生成（纯 Python 实现，零外部依赖） ---
-def generate_qr_svg(data, module_px=4, border=4):
-    """使用内置 QR 编码器生成 SVG 二维码字符串。"""
-    try:
-        modules, version = _generate_qr_modules(data)
-        size = len(modules)
-        total = (size + 2 * border) * module_px
-        margin = border * module_px
-        lines = [
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" '
-            'width="200" height="200" shape-rendering="crispEdges">' % (total, total),
-            '<rect width="%d" height="%d" fill="#ffffff"/>' % (total, total)
-        ]
-        for r in range(size):
-            for c in range(size):
-                if modules[r][c]:
-                    lines.append(
-                        '<rect x="%d" y="%d" width="%d" height="%d" fill="#2e7d32"/>'
-                        % (margin + c * module_px, margin + r * module_px, module_px, module_px)
-                    )
-        lines.append('</svg>')
-        return '\n'.join(lines)
-    except Exception as e:
-        return (
-            '<div style="padding:16px 8px;color:#c62828;font-size:13px;text-align:center">'
-            'QR 生成失败: %s<br>请在手机浏览器访问:<br>'
-            '<b style="color:#2e7d32;font-size:14px">%s</b></div>' % (str(e), data)
-        )
 
 
 # --- SVG 图标（内联，不依赖任何外部资源） ---
@@ -798,7 +529,7 @@ PC_HTML = r"""<!DOCTYPE html>
   .msg .meta{font-size:10px;color:var(--c-text3);margin-top:5px;display:flex;align-items:center;gap:4px}
   .msg.pc .meta{justify-content:flex-end}
   @keyframes msgIn{from{opacity:0;transform:translateY(12px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
-  .input-area{padding:12px 16px 14px;border-top:1px solid var(--c-border);display:flex;gap:8px;align-items:flex-end;background:var(--c-surface);flex-shrink:0}
+  .input-area{padding:12px 16px 14px;border-top:1px solid var(--c-border);display:flex;gap:8px;align-items:flex-end;background:var(--c-surface);flex-shrink:0;position:relative}
   .input-area textarea{flex:1;border:1.5px solid var(--c-border);border-radius:var(--radius-xs);padding:10px 14px;font-size:14px;resize:none;outline:none;font-family:inherit;min-height:42px;max-height:120px;background:#f8fafc;color:var(--c-text);transition:border-color .2s,box-shadow .2s,background .2s}
   [data-theme="dark"] .input-area textarea{background:var(--c-surface)}
   .input-area textarea:focus{border-color:var(--c-primary);box-shadow:0 0 0 3px rgba(5,150,105,.12);background:var(--c-surface)}
@@ -1122,7 +853,7 @@ PC_HTML = r"""<!DOCTYPE html>
       Notification.requestPermission().then(function(p) { if (p === "granted") _notifyGranted = true; });
     }
   }
-  requestNotifyPermission();
+  var _blinkTimer = null, _blinkOrigTitle = "";
   function notifyMessage(msg) {
     var senderName = msg.sender_name || getDisplayName({id: msg.device_id, name: msg.device_id, type: "pc"});
     var preview = "";
@@ -1130,18 +861,21 @@ PC_HTML = r"""<!DOCTYPE html>
     else if (msg.type === "image") preview = "[图片]";
     else if (msg.type === "file") preview = "[文件] " + (msg.data && msg.data.name || "");
     if (preview.length > 40) preview = preview.substring(0, 40) + "...";
-    if (_notifyGranted) {
-      try { new Notification(senderName + " 发来消息", {body: preview, icon: "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="14" fill="#3b82f6"/><text x="16" y="22" text-anchor="middle" fill="white" font-size="16" font-weight="bold">(senderName[0]||"?")</text></svg>')}); } catch(e) {}
-    } else {
+    // 仅后台标签页发送系统通知
+    if (_notifyGranted && document.hidden) {
+      var avatarChar = (senderName[0] || "?").toUpperCase();
+      try { new Notification(senderName + " 发来消息", {body: preview, icon: "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="14" fill="#3b82f6"/><text x="16" y="22" text-anchor="middle" fill="white" font-size="16" font-weight="bold">' + avatarChar + '</text></svg>')}); } catch(e) {}
+    } else if (document.hidden) {
       showToast(senderName + ": " + (preview || "新消息"));
     }
-    // 闪烁标题
-    var origTitle = document.title;
+    // 标题闪烁（去抖：新消息重置闪烁计时）
+    if (_blinkTimer) clearInterval(_blinkTimer);
+    _blinkOrigTitle = document.title;
     var blinkCount = 0;
-    var blink = setInterval(function() {
+    _blinkTimer = setInterval(function() {
       blinkCount++;
-      document.title = (blinkCount % 2 === 0) ? origTitle : "\uD83D\uDD14 " + senderName + " \u00B7 " + origTitle;
-      if (blinkCount >= 6) { clearInterval(blink); document.title = origTitle; }
+      document.title = (blinkCount % 2 === 0) ? _blinkOrigTitle : "\uD83D\uDD14 " + senderName + " \u00B7 " + _blinkOrigTitle;
+      if (blinkCount >= 6) { clearInterval(_blinkTimer); _blinkTimer = null; document.title = _blinkOrigTitle; }
     }, 800);
   }
 
@@ -1412,6 +1146,10 @@ PC_HTML = r"""<!DOCTYPE html>
     }
     appendMessage(msg, true);
   });
+  evtSource.addEventListener("transfer_timeout", function(e) {
+    var info = JSON.parse(e.data);
+    showToast("\u26A0\uFE0F 文件传输失败: " + (info.filename || "未知文件") + " — " + (info.error || "超时"));
+  });
   evtSource.addEventListener("device_list", function(e) {
     var data = JSON.parse(e.data);
     renderDeviceList(data.devices || []);
@@ -1481,6 +1219,7 @@ PC_HTML = r"""<!DOCTYPE html>
   window.sendText = function() {
     var text = textInput.value.trim();
     if (!text) return;
+    requestNotifyPermission();
     if (currentDeviceCount === 0) {
       showToast("暂无设备连接，无法发送", true);
       return;
@@ -1544,6 +1283,42 @@ PC_HTML = r"""<!DOCTYPE html>
     pendingDropFiles = [];
     for (var i = 0; i < files.length; i++) pendingDropFiles.push(files[i]);
     showConfirmDialog(pendingDropFiles);
+  });
+
+  // 粘贴图片发送 (Ctrl+V)
+  document.addEventListener("paste", function(e) {
+    var items = (e.clipboardData || window.clipboardData).items;
+    if (!items) return;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf("image") !== 0) continue;
+      e.preventDefault();
+      if (currentDeviceCount === 0) { showToast("暂无设备连接，无法发送", true); return; }
+      var blob = items[i].getAsFile();
+      var reader = new FileReader();
+      reader.onload = function(ev) {
+        var dataUri = ev.target.result;
+        if (dataUri.length > 5 * 1024 * 1024) {
+          // 大图片走分块传输
+          var fakeFile = new File([blob], "clipboard_" + Date.now() + ".png", {type: blob.type});
+          sendFileChunked(fakeFile, true);
+        } else {
+          fetch("/send", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({image: dataUri, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
+          }).then(function(r) { return r.json(); }).then(function(d) {
+            if (!d.ok) throw new Error("发送失败");
+            var localMsg = {id: d.msg_id, type: "image", data: dataUri, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
+            seenMsgs.add(localMsg.id); allMessages.push(localMsg);
+            appendMessage(localMsg, true);
+          }).catch(function() { showToast("图片发送失败", true); });
+        }
+        showToast("已粘贴图片，正在发送...");
+        requestNotifyPermission();
+      };
+      reader.readAsDataURL(blob);
+      break;
+    }
   });
 
   function showConfirmDialog(files) {
@@ -1746,6 +1521,7 @@ PC_HTML = r"""<!DOCTYPE html>
   setupFileInput(videoInput);
   setupFileInput(docInput);
   setupFileInput(otherInput);
+
 })();
 </script>
 </body>
@@ -2032,6 +1808,10 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     }
     appendMessage(msg, true);
   });
+  evtSource.addEventListener("transfer_timeout", function(e) {
+    var info = JSON.parse(e.data);
+    showToast("\u26A0\uFE0F 文件传输失败: " + (info.filename || "未知文件") + " — " + (info.error || "超时"));
+  });
   evtSource.addEventListener("device_list", function(e) {
     var data = JSON.parse(e.data);
     renderSidebar(data.devices || []);
@@ -2089,9 +1869,12 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   // 新消息通知
   var _notifyGranted_m = false;
   if ("Notification" in window && Notification.permission === "granted") _notifyGranted_m = true;
-  if ("Notification" in window && Notification.permission === "default") {
-    Notification.requestPermission().then(function(p) { if (p === "granted") _notifyGranted_m = true; });
+  function requestNotifyPermission() {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().then(function(p) { if (p === "granted") _notifyGranted_m = true; });
+    }
   }
+  var _blinkTimer_m = null, _blinkOrigTitle_m = "";
   function notifyMessage(msg) {
     var senderName = msg.sender_name || getDisplayName({id: msg.device_id, name: msg.device_id, type: "pc"});
     var preview = "";
@@ -2099,10 +1882,22 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     else if (msg.type === "image") preview = "[图片]";
     else if (msg.type === "file") preview = "[文件] " + (msg.data && msg.data.name || "");
     if (preview.length > 40) preview = preview.substring(0, 40) + "...";
-    if (_notifyGranted_m) {
-      try { new Notification(senderName + " 发来消息", {body: preview}); } catch(e) {}
+    // 仅后台标签页发送系统通知
+    if (_notifyGranted_m && document.hidden) {
+      var avatarChar = (senderName[0] || "?").toUpperCase();
+      try { new Notification(senderName + " 发来消息", {body: preview, icon: "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="14" fill="#2e7d32"/><text x="16" y="22" text-anchor="middle" fill="white" font-size="16" font-weight="bold">' + avatarChar + '</text></svg>')}); } catch(e) {}
+    } else {
+      showToast(senderName + ": " + (preview || "新消息"));
     }
-    showToast(senderName + ": " + (preview || "新消息"));
+    // 标题闪烁（去抖）
+    if (_blinkTimer_m) clearInterval(_blinkTimer_m);
+    _blinkOrigTitle_m = document.title;
+    var blinkCount = 0;
+    _blinkTimer_m = setInterval(function() {
+      blinkCount++;
+      document.title = (blinkCount % 2 === 0) ? _blinkOrigTitle_m : "\uD83D\uDD14 " + senderName + " \u00B7 " + _blinkOrigTitle_m;
+      if (blinkCount >= 6) { clearInterval(_blinkTimer_m); _blinkTimer_m = null; document.title = _blinkOrigTitle_m; }
+    }, 800);
   }
 
   // --- 侧边栏 ---
@@ -2353,6 +2148,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   window.sendText = function() {
     const text = textInput.value.trim();
     if (!text) return;
+    requestNotifyPermission();
     fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -2427,6 +2223,22 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   setupFileInput(videoInput);
   setupFileInput(docInput);
   setupFileInput(otherInput);
+
+  // 粘贴图片发送（移动端也支持）
+  document.addEventListener("paste", function(e) {
+    var items = (e.clipboardData || window.clipboardData).items;
+    if (!items) return;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf("image") !== 0) continue;
+      e.preventDefault();
+      var blob = items[i].getAsFile();
+      var f = new File([blob], "clipboard_" + Date.now() + ".png", {type: blob.type});
+      sendFileChunked(f, true);
+      showToast("已粘贴图片，正在发送...");
+      requestNotifyPermission();
+      break;
+    }
+  });
 })();
 </script>
 </body>
@@ -2506,6 +2318,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.wfile.flush()
 
+    def send_error_json(self, code, msg):
+        """API 端点用：返回 JSON 格式错误"""
+        body = json.dumps({"error": msg}, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -2534,11 +2356,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             dev_id = params.get("id", [""])[0]
             new_name = params.get("name", [""])[0]
             if not dev_id or not new_name:
-                self.send_error_body(400, "Missing id or name")
+                self.send_error_json(400, "Missing id or name")
                 return
             new_name = new_name.strip()[:20]
             if not new_name:
-                self.send_error_body(400, "Name cannot be empty")
+                self.send_error_json(400, "Name cannot be empty")
                 return
 
             # 通过 device_id 匹配（device_id 在 SSE 握手时分配，非公开）
@@ -2550,7 +2372,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         renamed = True
                         break
             if not renamed:
-                self.send_error_body(404, "Device not found")
+                self.send_error_json(404, "Device not found")
                 return
 
             # 持久化到 identity_map
@@ -2752,18 +2574,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             # 速率限制
             client_ip = self.client_address[0]
             if not check_rate_limit(client_ip):
-                self.send_error_body(429, "Too many requests")
+                self.send_error_json(429, "Too many requests")
                 return
 
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length > MAX_BODY_SIZE:
-                self.send_error_body(413, "Request too large")
+                self.send_error_json(413, "Request too large")
                 return
             body = self.rfile.read(content_length)
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
-                self.send_error_body(400, "Invalid JSON")
+                self.send_error_json(400, "Invalid JSON")
                 return
 
             sender = data.get("sender", "")
@@ -2780,13 +2602,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 transfer_id = str(data["transfer_id"]).strip()
                 chunk_b64 = data.get("chunk_data", "")
                 if not transfer_id or not re.match(r'^[a-zA-Z0-9\-_]+$', transfer_id):
-                    self.send_error_body(400, "Invalid transfer_id")
+                    self.send_error_json(400, "Invalid transfer_id")
                     return
                 if chunk_index < 0 or chunk_index >= total_chunks or total_chunks > 10000:
-                    self.send_error_body(400, "Invalid chunk index or total_chunks")
+                    self.send_error_json(400, "Invalid chunk index or total_chunks")
                     return
                 if len(chunk_b64) > CHUNK_SIZE_LIMIT * 2:
-                    self.send_error_body(413, "Chunk too large")
+                    self.send_error_json(413, "Chunk too large")
                     return
 
                 _ensure_chunk_dir()
@@ -2797,7 +2619,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 try:
                     chunk_bin = base64.b64decode(chunk_b64)
                 except Exception:
-                    self.send_error_body(400, "Invalid chunk base64")
+                    self.send_error_json(400, "Invalid chunk base64")
                     return
                 with open(os.path.join(transfer_dir, f"{chunk_index}.chunk"), "wb") as f:
                     f.write(chunk_bin)
@@ -2809,10 +2631,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                         ct_info = {"name": "unknown", "size": 0, "mime": "application/octet-stream"}
                     fsize = ct_info.get("size", 0)
                     if fsize > MAX_CHUNKED_FILE:
-                        self.send_error_body(413, f"File too large (max {MAX_CHUNKED_FILE // (1024*1024)}MB)")
+                        self.send_error_json(413, f"File too large (max {MAX_CHUNKED_FILE // (1024*1024)}MB)")
                         return
                     if total_chunks > 10000:
-                        self.send_error_body(400, "Too many chunks")
+                        self.send_error_json(400, "Too many chunks")
                         return
                     chunk_transfers[transfer_id] = {
                         "chunks": set(),
@@ -2828,7 +2650,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 ct = chunk_transfers[transfer_id]
                 # 校验：后续分块必须来自同一个发送者
                 if ct["device_id"] != dev_id:
-                    self.send_error_body(403, "Transfer owned by another device")
+                    self.send_error_json(403, "Transfer owned by another device")
                     return
                 ct["chunks"].add(chunk_index)
                 received = sorted(ct["chunks"])
@@ -2840,7 +2662,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     for i in range(ct["total"]):
                         cp = os.path.join(transfer_dir, f"{i}.chunk")
                         if not os.path.isfile(cp):
-                            self.send_error_body(400, f"Missing chunk {i}")
+                            self.send_error_json(400, f"Missing chunk {i}")
                             return
                         with open(cp, "rb") as f:
                             full_bin += f.read()
@@ -2857,11 +2679,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                         data_uri = f"data:{mime};base64,{fb64}"
                         if len(data_uri) > 5 * 1024 * 1024:
                             # 图片太大走文件模式
-                            msg_id = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+                            msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
                         else:
-                            msg_id = add_message("image", data_uri, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+                            msg_id, _ = add_message("image", data_uri, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
                     else:
-                        msg_id = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+                        msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
 
                     # 清理分块
                     shutil.rmtree(transfer_dir, ignore_errors=True)
@@ -2876,30 +2698,34 @@ class RequestHandler(BaseHTTPRequestHandler):
             if "text" in data and data["text"]:
                 text = data["text"]
                 if len(text) > 10000:
-                    self.send_error_body(413, "Text too long (max 10000 chars)")
+                    self.send_error_json(413, "Text too long (max 10000 chars)")
                     return
-                msg_id = add_message("text", text, sender, dev_name, dev_id, target_id)
+                msg_id, target_ok = add_message("text", text, sender, dev_name, dev_id, target_id)
             elif "image" in data and data["image"]:
                 img_data = data["image"]
                 if len(img_data) > 5 * 1024 * 1024:
-                    self.send_error_body(413, "Image too large (max 5MB)")
+                    self.send_error_json(413, "Image too large (max 5MB)")
                     return
                 if not img_data.startswith("data:image/"):
-                    self.send_error_body(400, "Only data:image/... URIs accepted")
+                    self.send_error_json(400, "Only data:image/... URIs accepted")
                     return
-                msg_id = add_message("image", img_data, sender, dev_name, dev_id, target_id)
+                msg_id, target_ok = add_message("image", img_data, sender, dev_name, dev_id, target_id)
             elif "file" in data and data["file"]:
                 file_data = data["file"]
                 if not isinstance(file_data, dict):
-                    self.send_error_body(400, "Invalid file data")
+                    self.send_error_json(400, "Invalid file data")
                     return
                 fsize = file_data.get("size", 0)
                 if fsize > 50 * 1024 * 1024:
-                    self.send_error_body(413, "File too large (max 50MB)")
+                    self.send_error_json(413, "File too large (max 50MB)")
                     return
-                msg_id = add_message("file", file_data, sender, dev_name, dev_id, target_id)
+                msg_id, target_ok = add_message("file", file_data, sender, dev_name, dev_id, target_id)
             else:
-                self.send_error_body(400, "No text, image or file")
+                self.send_error_json(400, "No text, image or file")
+                return
+
+            if target_id and not target_ok:
+                self.send_error_json(404, "目标设备不在线")
                 return
 
             self.send_json(200, {"ok": True, "msg_id": msg_id})
@@ -2978,6 +2804,20 @@ def main():
 
     try:
         server = ThreadingHTTPServer(("0.0.0.0", PORT), RequestHandler)
+        # 配置 TCP keepalive，快速检测断开的连接
+        server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if sys.platform == "darwin":
+            # macOS: TCP_KEEPALIVE = 0x10 (idle seconds before probe)
+            server.socket.setsockopt(socket.IPPROTO_TCP, 0x10, 30)   # 30秒空闲后开始探测
+        elif sys.platform.startswith("linux"):
+            server.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        # 探测间隔和次数（跨平台通用）
+        if sys.platform in ("darwin", "linux"):
+            try:
+                server.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)   # 5秒间隔
+                server.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)     # 3次探测失败即断开
+            except (OSError, AttributeError):
+                pass  # 某些 Python 版本可能不支持这些选项
     except OSError as e:
         if e.errno == 48 or e.errno == 10048:  # Address already in use
             print(f"\n  \033[91m端口 {PORT} 已被占用，且不是飞递进程。\033[0m")
@@ -2993,12 +2833,10 @@ def main():
     try:
         # 启动过期分块清理线程（每 5 分钟清理一次）
         import threading
-        def _chunk_cleanup_loop():
-            while not _server_stopped:
-                time.sleep(300)
-                _cleanup_stale_chunks()
+        # 启动时清理上次残留
+        _startup_cleanup()
         _server_stopped = False
-        cleanup_thread = threading.Thread(target=_chunk_cleanup_loop, daemon=True)
+        cleanup_thread = threading.Thread(target=_periodic_cleanup_loop, daemon=True)
         cleanup_thread.start()
         server.serve_forever()
     except KeyboardInterrupt:
