@@ -372,8 +372,9 @@ def _release_file(msg_id):
                 try:
                     if os.path.exists(p):
                         os.remove(p)
-                except OSError:
-                    pass  # best-effort
+                except OSError as e:
+                    # M-2: best-effort 但不静默——磁盘满/权限漂移需要能看见
+                    print(f"[feidi] _release_file: cleanup failed: {p}: {e}", flush=True)
 
 
 def _cleanup_msg_files(msg_id):
@@ -393,8 +394,9 @@ def _cleanup_msg_files(msg_id):
                 try:
                     if os.path.exists(p):
                         os.remove(p)
-                except OSError:
-                    pass  # best-effort
+                except OSError as e:
+                    # M-2: best-effort 但不静默——磁盘满/权限漂移需要能看见
+                    print(f"[feidi] _cleanup_msg_files: cleanup failed: {p}: {e}", flush=True)
 
 
 def check_rate_limit(client_ip):
