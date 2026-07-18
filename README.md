@@ -94,4 +94,4 @@ pyinstaller --onefile --name Feidi --console --clean transfer.py
 
 ## License
 
-MIT
+MIT — 详见 [LICENSE](LICENSE)。

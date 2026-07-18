@@ -16,7 +16,7 @@ elif command -v python &> /dev/null; then
     python transfer.py "$@"
 else
     echo ""
-    echo "[错误] 未找到可用的 Python，请先安装 Python 3.7+"
+    echo "[错误] 未找到可用的 Python 3.9+，请先安装"
     echo "macOS 可用: brew install python3"
     echo "Linux 可用: sudo apt install python3"
     echo ""

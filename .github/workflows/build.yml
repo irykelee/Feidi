@@ -16,12 +16,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install pyinstaller
-      - run: pyinstaller --onefile --name Feidi-win --console --clean transfer.py
-      - uses: actions/upload-artifact@v4
+      - run: pip install -r requirements-build.txt
+      # H-8: 用 spec 打包，spec 已包含 qrcode_lib datas + hiddenimports
+      - run: pyinstaller --noconfirm --clean build.spec
+      - name: 上传到 Actions（actions/upload-artifact 会把 .exe 标记为可执行）
+        uses: actions/upload-artifact@v4
         with:
           name: Feidi-win
-          path: dist/Feidi-win.exe
+          path: dist/Feidi.exe
+          if-no-files-found: error
+          retention-days: 14
 
   build-macos:
     runs-on: macos-latest
@@ -30,12 +34,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install pyinstaller
-      - run: pyinstaller --onefile --name Feidi-macos --console --clean transfer.py
+      - run: pip install -r requirements-build.txt
+      - run: pyinstaller --noconfirm --clean build_mac.spec
+      # H-10: 把 .app 打成 ditto archive，避免 upload-artifact 抹掉可执行位
+      # ditto -c -k 实际生成 zip；扩展名与 build.yml 其它部分用 .zip
+      - name: 打包成 .app.zip
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/Feidi.app dist/Feidi-macos.zip
       - uses: actions/upload-artifact@v4
         with:
           name: Feidi-macos
-          path: dist/Feidi-macos
+          path: dist/Feidi-macos.zip
+          if-no-files-found: error
+          retention-days: 14
 
   release:
     needs: [build-windows, build-macos]
@@ -47,18 +58,28 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: Feidi-macos
+      # B7: 生成 SHA256SUMS 与产物同发
+      - name: 生成校验和
+        run: sha256sum Feidi.exe Feidi-macos.zip > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: nightly
-          name: 最新构建
+          # B1: tag 改用 nightly-<sha>，避免反复覆盖
+          tag_name: nightly-${{ github.sha }}
+          name: Nightly build ${{ github.sha }}
           body: |
             自动构建于 ${{ github.sha }}
 
             | 平台 | 文件 |
             |------|------|
-            | Windows | `Feidi-win.exe` |
-            | macOS | `Feidi-macos` |
+            | Windows | `Feidi.exe` |
+            | macOS | `Feidi-macos.zip`（含 .app 目录） |
+
+            校验：
+            ```bash
+            sha256sum -c SHA256SUMS
+            ```
           files: |
-            Feidi-win.exe
-            Feidi-macos
+            Feidi.exe
+            Feidi-macos.zip
+            SHA256SUMS
           prerelease: true

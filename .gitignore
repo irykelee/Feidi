@@ -24,3 +24,7 @@ dist/
 dist/
 Feidi.spec
 build/
+
+# 自动生成 spec（手写的 build.spec / build_mac.spec 仍 tracked）
+Feidi-*.spec
+transfer.spec

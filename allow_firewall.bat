@@ -2,11 +2,25 @@
 chcp 65001 >nul
 title 飞递 Feidi - 防火墙放行
 
+:: H-11: 检测管理员权限；非管理员则通过 PowerShell 触发 UAC 自我提权
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo.
+    echo =================== 飞递 Feidi ===================
+    echo.
+    echo  需要管理员权限来添加防火墙规则。
+    echo  接下来会弹出 UAC 确认框，请点「是」。
+    echo.
+    echo ======================================================
+    echo.
+    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
+)
+
 echo.
 echo =================== 飞递 Feidi ===================
 echo.
 echo  正在为 飞递 Feidi 添加 Windows 防火墙放行规则...
-echo  如果弹出 UAC 确认框，请点「是」
 echo.
 echo ======================================================
 echo.

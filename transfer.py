@@ -24,9 +24,13 @@ import threading
 import webbrowser
 import tempfile
 import socketserver
+import hashlib
+import ipaddress
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
+
+__version__ = "1.0.1-audit"
 
 # --- QR 码生成（基于 qrcode 库，纯 Python） ---
 
@@ -118,8 +122,6 @@ LOCAL_IP = None  # 缓存，首次调用 get_local_ip() 后填充
 messages = []
 # 图片消息的文件路径: {msg_id: (bin_path, mime_path)}
 MSG_FILES = {}
-# 分块传输: transfer_id -> {chunks: set, total: int, info: dict, created: timestamp, sender, device_name, device_id, target_id}
-chunk_transfers = {}
 CHUNK_SIZE_LIMIT = 2 * 1024 * 1024  # 单块最大 2MB (base64 后 ~2.7MB JSON)
 MAX_CHUNKED_FILE = 500 * 1024 * 1024  # 最大 500MB
 MAX_MESSAGES = 200
@@ -132,6 +134,12 @@ RATE_WINDOW = 1.0
 sse_clients = []
 _sse_lock = threading.Lock()
 _msg_lock = threading.Lock()
+# 分块传输: transfer_id -> {chunks: set, total: int, info: dict, created: timestamp, sender, device_name, device_id, target_id}
+chunk_transfers = {}
+# 保护 chunk_transfers 的所有读写（包括 set.add、dict 覆盖、组装读 ct、删除）。BaseHTTPRequestHandler 在 ThreadingMixIn 线程中并发执行。
+_chunk_lock = threading.Lock()
+# 最大并发分块传输数（防止恶意客户端无限发起 transfer 撑爆内存 / 磁盘）
+MAX_CONCURRENT_TRANSFERS = 100
 # 身份持久化: {identity_key: {device_id, name, hostname, last_ip, mac, type, first_seen, last_seen}}
 IDENTITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feidi_identities.json")
 identity_map = {}
@@ -140,24 +148,45 @@ _server_hostname = socket.gethostname()
 
 def load_identities():
     global identity_map
+    if not os.path.exists(IDENTITY_FILE):
+        return
     try:
-        if os.path.exists(IDENTITY_FILE):
-            with open(IDENTITY_FILE, "r", encoding="utf-8") as f:
-                identity_map = json.load(f)
+        with open(IDENTITY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            identity_map = data
     except Exception:
-        identity_map = {}
-
-
-def save_identities():
-    try:
-        with open(IDENTITY_FILE, "w", encoding="utf-8") as f:
-            json.dump(identity_map, f, ensure_ascii=False, indent=2)
-    except Exception:
+        # 保留旧值，避免断电 / 半写导致全部身份静默丢失
         pass
 
 
+def save_identities():
+    """原子写：写到 .tmp 再 os.replace，防止断电时 JSON 截断。"""
+    tmp = IDENTITY_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(identity_map, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, IDENTITY_FILE)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _hash_mac(mac: str) -> str:
+    """M-5: 持久化前对 MAC 哈希，避免明文存储。"""
+    if not mac:
+        return ""
+    salt = b"feidi-mac-v1"
+    return hashlib.sha256(salt + mac.upper().encode("utf-8")).hexdigest()[:16]
+
+
 def get_mac(ip):
-    """尝试通过 arp 表获取指定 IP 的 MAC 地址。"""
+    """尝试通过 arp 表获取指定 IP 的 MAC 地址（原始值，调用方负责哈希）。"""
     try:
         result = subprocess.run(["arp", "-a", ip], capture_output=True, text=True, timeout=3)
         match = re.search(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", result.stdout)
@@ -359,22 +388,36 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
         msg_files = (bin_path, mime_path)
         msg["data"] = f"/img/{msg_id}"
     elif msg_type == "file":
-        # data = {"name": str, "size": int, "mime": str, "data": base64_str}
+        # data 两种形态：
+        #   1) {"name","size","mime","data": base64_str} —— 旧路径，POST /send 非分块模式
+        #   2) {"name","size","mime","path": "/file/<id>"} —— 分块模式上层已写盘
+        #   3) {"name","size","mime","bytes": bytes} —— 内存直传，chunked 组装完成流式落盘
         file_info = data if isinstance(data, dict) else {}
         fname = file_info.get("name", "unknown")
         fsize = file_info.get("size", 0)
         fmime = file_info.get("mime", "application/octet-stream")
-        fb64 = file_info.get("data", "")
-        try:
-            fbin = base64.b64decode(fb64) if fb64 else b""
-        except Exception:
-            fbin = b""
         fpath = os.path.join(TEMP_DIR, f"file_{msg_id}.bin")
         fmeta = os.path.join(TEMP_DIR, f"file_{msg_id}.meta.json")
-        with open(fpath, "wb") as f:
-            f.write(fbin)
+        if "bytes" in file_info and isinstance(file_info["bytes"], (bytes, bytearray)):
+            with open(fpath, "wb") as f:
+                f.write(file_info["bytes"])
+                f.flush()
+                os.fsync(f.fileno())
+            fsize = len(file_info["bytes"])
+        else:
+            fb64 = file_info.get("data", "")
+            try:
+                fbin = base64.b64decode(fb64) if fb64 else b""
+            except Exception:
+                fbin = b""
+            with open(fpath, "wb") as f:
+                f.write(fbin)
+                f.flush()
+                os.fsync(f.fileno())
         with open(fmeta, "w", encoding="utf-8") as f:
-            json.dump({"name": fname, "size": fsize, "mime": fmime}, f)
+            f.flush()
+            os.fsync(f.fileno())
+            json.dump({"name": fname, "size": fsize, "mime": fmime}, f, ensure_ascii=False)
         msg_files = (fpath, fmeta)
         msg["data"] = {"name": fname, "size": fsize, "mime": fmime, "path": f"/file/{msg_id}"}
     else:
@@ -1182,13 +1225,25 @@ PC_HTML = r"""<!DOCTYPE html>
     } else if (msg.type === "image") {
       var img = document.createElement("img");
       img.src = msg.data;
-      img.onclick = function() { window.open(msg.data); };
-      div.appendChild(img);
+      // M-6: 取消 window.open 防止 SVG/HTML 走新 tab 同源执行；改为下载原图
+      var dl = document.createElement("a");
+      dl.href = msg.data;
+      dl.download = "image";
+      dl.appendChild(img);
+      div.appendChild(dl);
     } else if (msg.type === "file" && msg.data) {
       var fd = msg.data;
       var card = document.createElement("div");
       card.className = "file-card";
-      card.onclick = function() { window.open(fd.path); };
+      // M-6: window.open 改为 <a download> 触发下载，避免新 tab 同源渲染任意 Content-Type
+      var a = document.createElement("a");
+      a.href = fd.path;
+      a.download = fd.name || "download";
+      a.appendChild(card);
+      // 给内部元素保留 click（点击下载）
+      var inner = document.createElement("div");
+      inner.style.cursor = "pointer";
+      inner.onclick = function() { a.click(); };
       var ficon = document.createElement("div");
       var ext = (fd.name || "").split(".").pop().toLowerCase();
       var ic = "&#x1F4C4;"; var icCls = "other";
@@ -1224,14 +1279,16 @@ PC_HTML = r"""<!DOCTYPE html>
       showToast("暂无设备连接，无法发送", true);
       return;
     }
+    // M-2: 锁定发送时的私聊目标，避免 POST 与 localMsg 不一致
+    var textTarget = selectedDevice || null;
     fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
+      body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: textTarget})
     }).then(function(r) { return r.json(); }).then(function(data) {
       if (!data.ok) throw new Error("发送失败");
       // 本地立即显示（因 exclude_device 不会通过 SSE 回传）
-      var localMsg = {id: data.msg_id, type: "text", data: text, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
+      var localMsg = {id: data.msg_id, type: "text", data: text, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: textTarget, time: Date.now()};
       seenMsgs.add(localMsg.id);
       appendMessage(localMsg, true);
     }).catch(function() {
@@ -1369,6 +1426,7 @@ PC_HTML = r"""<!DOCTYPE html>
     var totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     if (totalChunks === 0) totalChunks = 1;
     var transferId = generateTransferId();
+    var targetAtStart = selectedDevice || null;
     var receivedSet = {};  // chunk_index -> true
     var progressToastId = null;
 
@@ -1408,7 +1466,7 @@ PC_HTML = r"""<!DOCTYPE html>
           sender: SENDER,
           device_name: MY_NAME,
           device_id: MY_ID,
-          target_id: selectedDevice || null
+          target_id: targetAtStart
         };
         if (isImage) body.image_type = true;
 
@@ -1422,7 +1480,26 @@ PC_HTML = r"""<!DOCTYPE html>
             showProgress(Object.keys(receivedSet).length, totalChunks);
             if (data.complete) {
               if (progressToastId) { clearTimeout(progressToastId); progressToastId = null; }
-              // 消息通过 SSE 广播到达，无需本地创建
+              if (!isImage) {
+                var localMsg = {
+                  id: data.msg_id,
+                  type: "file",
+                  data: {
+                    name: file.name,
+                    size: file.size,
+                    mime: file.type || "application/octet-stream",
+                    path: "/file/" + data.msg_id
+                  },
+                  sender: SENDER,
+                  sender_name: "我",
+                  device_id: MY_ID,
+                  target_id: targetAtStart,
+                  time: Date.now()
+                };
+                seenMsgs.add(localMsg.id);
+                appendMessage(localMsg, true);
+              }
+              showToast(file.name + " 发送成功");
             } else {
               sendNext();
             }
@@ -2063,13 +2140,25 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     } else if (msg.type === "image") {
       const img = document.createElement("img");
       img.src = msg.data;
-      img.onclick = function() { window.open(msg.data); };
-      div.appendChild(img);
+      // M-6: 改 a.download，禁掉 window.open
+      const dlImg = document.createElement("a");
+      dlImg.href = msg.data;
+      dlImg.download = "image";
+      dlImg.appendChild(img);
+      div.appendChild(dlImg);
     } else if (msg.type === "file" && msg.data) {
       var fd = msg.data;
       var card = document.createElement("div");
       card.style.cssText = "display:flex;align-items:center;gap:8px;padding:8px;background:rgba(255,255,255,.4);border-radius:8px;cursor:pointer";
-      card.onclick = function() { window.open(fd.path); };
+      card.onclick = function() {
+        // M-6: 用 <a download> 触发下载，避免新 tab 渲染任意 Content-Type
+        const a = document.createElement("a");
+        a.href = fd.path;
+        a.download = fd.name || "download";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      };
       var ficon = document.createElement("div");
       ficon.style.cssText = "width:32px;height:32px;background:rgba(0,0,0,.08);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:14px";
       ficon.textContent = "\uD83D\uDCC4";
@@ -2099,6 +2188,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     var totalChunks = Math.ceil(file.size / CHUNK_SIZE_m);
     if (totalChunks === 0) totalChunks = 1;
     var transferId = generateTransferId();
+    var targetAtStart = selectedDevice || null;
     var receivedSet = {};
     function sendChunk(index, retryCount) {
       retryCount = retryCount || 0;
@@ -2112,7 +2202,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
         var body = {
           chunk_index: index, total_chunks: totalChunks, transfer_id: transferId, chunk_data: b64,
           file_info: {name: file.name, size: file.size, mime: file.type || "application/octet-stream"},
-          sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null
+          sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: targetAtStart
         };
         if (isImage) body.image_type = true;
         fetch("/send", {
@@ -2122,7 +2212,28 @@ MOBILE_HTML = r"""<!DOCTYPE html>
         }).then(function(r) { return r.json(); }).then(function(data) {
           if (data.ok && data.received) {
             data.received.forEach(function(i) { receivedSet[i] = true; });
-            if (data.complete) { /* SSE 广播 */ }
+            if (data.complete) {
+              if (!isImage) {
+                var localMsg = {
+                  id: data.msg_id,
+                  type: "file",
+                  data: {
+                    name: file.name,
+                    size: file.size,
+                    mime: file.type || "application/octet-stream",
+                    path: "/file/" + data.msg_id
+                  },
+                  sender: SENDER,
+                  sender_name: "我",
+                  device_id: MY_ID,
+                  target_id: targetAtStart,
+                  time: Date.now()
+                };
+                seenMsgs.add(localMsg.id);
+                appendMessage(localMsg, true);
+              }
+              showToast(file.name + " 发送成功");
+            }
             else { sendNext(); }
           } else if (retryCount < 5) {
             setTimeout(function() { sendChunk(index, retryCount + 1); }, 1000 * (retryCount + 1));
@@ -2149,13 +2260,14 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     const text = textInput.value.trim();
     if (!text) return;
     requestNotifyPermission();
+    var textTarget = selectedDevice || null;
     fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
+      body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: textTarget})
     }).then(function(r) { return r.json(); }).then(function(data) {
       if (!data.ok) throw new Error("发送失败");
-      var localMsg = {id: data.msg_id, type: "text", data: text, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: selectedDevice || null, time: Date.now()};
+      var localMsg = {id: data.msg_id, type: "text", data: text, sender: SENDER, sender_name: "我", device_id: MY_ID, target_id: textTarget, time: Date.now()};
       seenMsgs.add(localMsg.id);
       appendMessage(localMsg, true);
     }).catch(function() {
@@ -2285,9 +2397,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         return secrets.compare_digest(cookies.get("feidi_auth", ""), AUTH_TOKEN)
 
     def set_auth_cookie(self):
+        # H-6: HttpOnly 防 JS 读取；plaintext HTTP 不能加 Secure；SameSite=Lax 保持
         self.send_header(
             "Set-Cookie",
-            f"feidi_auth={AUTH_TOKEN}; Path=/; Max-Age=86400; SameSite=Lax",
+            f"feidi_auth={AUTH_TOKEN}; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly",
         )
 
     def send_html(self, html_content):
@@ -2400,14 +2513,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             with open(mime_path, "r", encoding="utf-8") as f:
                 mime = f.read().strip()
-            with open(bin_path, "rb") as f:
-                img_bin = f.read()
+            # C-4: 强校验 image/* 白名单，阻止 SVG/HTML 走 image 路径执行同源 JS
+            if not re.match(r'^image/(png|jpe?g|gif|webp|bmp)$', mime, re.IGNORECASE):
+                self.send_error_body(415, f"Unsupported image type: {mime}")
+                return
+            fsize = os.path.getsize(bin_path)
             self.send_response(200)
             self.send_header("Content-Type", mime)
-            self.send_header("Cache-Control", "public, max-age=60")
-            self.send_header("Content-Length", str(len(img_bin)))
+            self.send_header("Content-Disposition", 'attachment; filename="image"')  # 防 XSS 走 iframe
+            self.send_header("Content-Length", str(fsize))
+            self.send_header("Cache-Control", "no-store")
+            # H-5: 拒绝跨域读图（避免外部页面 fetch 后渲染）
+            self.send_header("Access-Control-Allow-Origin", "null")
             self.end_headers()
-            self.wfile.write(img_bin)
+            # H-2: 流式复制
+            with open(bin_path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 64 * 1024)
             self.wfile.flush()
 
         elif path.startswith("/file/"):
@@ -2423,20 +2544,34 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             with open(fmeta, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            with open(fpath, "rb") as f:
-                fbin = f.read()
+            # C-5: filename 去 CRLF / 引号，限制长度
+            raw_name = meta.get("name", "download")
+            safe_name = re.sub(r'[\r\n"\\]', '_', str(raw_name))[:200] or "download"
+            # 仅放行常见二进制 mime，避免任意 Content-Type 误用
+            mime = meta.get("mime", "application/octet-stream")
+            if not re.match(r'^(application|audio|video|text|image|font)/', mime, re.IGNORECASE):
+                mime = "application/octet-stream"
+            fsize = os.path.getsize(fpath)
             self.send_response(200)
-            self.send_header("Content-Type", meta.get("mime", "application/octet-stream"))
-            self.send_header("Content-Disposition", f'attachment; filename="{meta.get("name", "download")}"')
-            self.send_header("Content-Length", str(len(fbin)))
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+            self.send_header("Content-Length", str(fsize))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "null")
             self.end_headers()
-            self.wfile.write(fbin)
+            with open(fpath, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 64 * 1024)
             self.wfile.flush()
 
         elif path == "/events":
             if len(sse_clients) >= MAX_SSE_CLIENTS:
                 self.send_error_body(503, "Too many connections")
+                return
+
+            # H-5: SSE 拒绝跨域读取（无 Origin 表示 native / 同源；外部 Origin 一律拒绝）
+            origin = self.headers.get("Origin")
+            if origin and not self._origin_allowed(origin):
+                self.send_error_body(403, "CORS denied")
                 return
 
             # 解析设备信息
@@ -2475,11 +2610,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if old_ip != client_ip and client_ip not in ("127.0.0.1", "::1"):
                     mac = get_mac(client_ip)
                     if mac:
-                        info["mac"] = mac
+                        info["mac"] = _hash_mac(mac)  # M-5: 不再明文
             else:
                 device_id = str(uuid.uuid4())[:8]
                 dev_name = my_name or dev_name or dev_type
-                mac = get_mac(client_ip) if client_ip not in ("127.0.0.1", "::1") else None
+                raw_mac = get_mac(client_ip) if client_ip not in ("127.0.0.1", "::1") else None
+                mac = _hash_mac(raw_mac) if raw_mac else None
                 identity_map[identity_key] = {
                     "device_id": device_id,
                     "name": dev_name,
@@ -2498,7 +2634,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            # H-5: 不再用 *；同源请求不带 Origin，反射请求的 Origin（如果允许）
+            self.send_header("Access-Control-Allow-Origin", origin if origin and self._origin_allowed(origin) else "null")
             self.end_headers()
             self.wfile.flush()
 
@@ -2549,6 +2686,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path == "/login":
+            # M-4: /login 同样加 rate-limit，限制 2 req/s/IP，避免弱密码被在线爆破
+            client_ip = self.client_address[0]
+            with _rate_lock:
+                now = time.time()
+                bucket = _rate_limits.get(client_ip, [])
+                bucket = [t for t in bucket if now - t < RATE_WINDOW]
+                if len(bucket) >= 2:
+                    _rate_limits[client_ip] = bucket
+                    self.send_error_json(429, "Too many requests")
+                    return
+                bucket.append(now)
+                _rate_limits[client_ip] = bucket
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length > 1024:
                 self.send_error_body(413, "Request too large")
@@ -2607,7 +2756,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if chunk_index < 0 or chunk_index >= total_chunks or total_chunks > 10000:
                     self.send_error_json(400, "Invalid chunk index or total_chunks")
                     return
-                if len(chunk_b64) > CHUNK_SIZE_LIMIT * 2:
+                # 按 decoded 字节数校验（之前只查 base64 长度，偏差约 33%）
+                try:
+                    chunk_bin = base64.b64decode(chunk_b64, validate=True) if chunk_b64 else b""
+                except Exception:
+                    self.send_error_json(400, "Invalid chunk base64")
+                    return
+                if len(chunk_bin) > CHUNK_SIZE_LIMIT:
                     self.send_error_json(413, "Chunk too large")
                     return
 
@@ -2615,83 +2770,139 @@ class RequestHandler(BaseHTTPRequestHandler):
                 transfer_dir = os.path.join(CHUNK_DIR, transfer_id)
                 os.makedirs(transfer_dir, exist_ok=True)
 
-                # 写入分块
-                try:
-                    chunk_bin = base64.b64decode(chunk_b64)
-                except Exception:
-                    self.send_error_json(400, "Invalid chunk base64")
-                    return
-                with open(os.path.join(transfer_dir, f"{chunk_index}.chunk"), "wb") as f:
-                    f.write(chunk_bin)
-
-                # 更新追踪
-                if transfer_id not in chunk_transfers:
-                    ct_info = data.get("file_info", {})
-                    if not ct_info:
-                        ct_info = {"name": "unknown", "size": 0, "mime": "application/octet-stream"}
-                    fsize = ct_info.get("size", 0)
-                    if fsize > MAX_CHUNKED_FILE:
+                # 串行化对同一 transfer_id 的处理：避免 ct["chunks"].add 与 dict 覆盖在并发线程间损坏。
+                # 也借此在新增 transfer 前拦截全局并发上限。所有写盘 / 状态翻转都在锁内，避免 2nd 审查的 HIGH：
+                # 1) size-exceeded 清理后写盘导致 FileNotFoundError
+                # 2) complete 在锁内算、锁外用导致双组装 → 重复消息
+                with _chunk_lock:
+                    if transfer_id not in chunk_transfers:
+                        if len(chunk_transfers) >= MAX_CONCURRENT_TRANSFERS:
+                            self.send_error_json(503, "Too many concurrent transfers")
+                            return
+                        ct_info = data.get("file_info") or {"name": "unknown", "size": 0, "mime": "application/octet-stream"}
+                        fsize = ct_info.get("size", 0)
+                        if fsize > MAX_CHUNKED_FILE:
+                            self.send_error_json(413, f"File too large (max {MAX_CHUNKED_FILE // (1024*1024)}MB)")
+                            return
+                        if total_chunks > 10000:
+                            self.send_error_json(400, "Too many chunks")
+                            return
+                        chunk_transfers[transfer_id] = {
+                            "chunks": set(),
+                            "total": total_chunks,
+                            "info": ct_info,
+                            "created": time.time(),
+                            "sender": sender,
+                            "device_name": dev_name,
+                            "device_id": dev_id,
+                            "target_id": target_id,
+                            "is_image": data.get("image_type") is True,
+                            "assembling": False,
+                        }
+                    ct = chunk_transfers[transfer_id]
+                    if ct["device_id"] != dev_id:
+                        self.send_error_json(403, "Transfer owned by another device")
+                        return
+                    if ct["assembling"]:
+                        # 另一个线程已经判定 complete 并开始组装；这个请求视为重复 ACK
+                        self.send_json(200, {"ok": True, "complete": True, "duplicate": True})
+                        return
+                    ct["chunks"].add(chunk_index)
+                    received = sorted(ct["chunks"])
+                    estimated_size = ct.get("bytes_received", 0) + len(chunk_bin)
+                    ct["bytes_received"] = estimated_size
+                    if estimated_size > MAX_CHUNKED_FILE:
+                        # 拒绝路径：清盘 + 摘条目 + 写盘仍在锁内所以安全
+                        chunk_transfers.pop(transfer_id, None)
+                        # 注意：要先发错误响应再 return 之前把 transfer_dir 删了；先写盘让目录存在
+                        try:
+                            with open(os.path.join(transfer_dir, f"{chunk_index}.chunk"), "wb") as f:
+                                f.write(chunk_bin)
+                                f.flush()
+                                os.fsync(f.fileno())
+                        except OSError:
+                            pass
+                        shutil.rmtree(transfer_dir, ignore_errors=True)
                         self.send_error_json(413, f"File too large (max {MAX_CHUNKED_FILE // (1024*1024)}MB)")
                         return
-                    if total_chunks > 10000:
-                        self.send_error_json(400, "Too many chunks")
-                        return
-                    chunk_transfers[transfer_id] = {
-                        "chunks": set(),
-                        "total": total_chunks,
-                        "info": ct_info,
-                        "created": time.time(),
-                        "sender": sender,
-                        "device_name": dev_name,
-                        "device_id": dev_id,
-                        "target_id": target_id,
-                        "is_image": data.get("image_type") is True,
-                    }
-                ct = chunk_transfers[transfer_id]
-                # 校验：后续分块必须来自同一个发送者
-                if ct["device_id"] != dev_id:
-                    self.send_error_json(403, "Transfer owned by another device")
+                    complete = len(received) == ct["total"]
+                    is_image = ct["is_image"]
+                    file_info = dict(ct["info"])
+                    if complete:
+                        # 立刻在锁内翻转 assembling 旗标，阻止后续重发的最后一块进入组装
+                        ct["assembling"] = True
+
+                # 写盘：先 fsync 再出锁
+                with open(os.path.join(transfer_dir, f"{chunk_index}.chunk"), "wb") as f:
+                    f.write(chunk_bin)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                if not complete:
+                    self.send_json(200, {"ok": True, "received": received, "complete": False})
                     return
-                ct["chunks"].add(chunk_index)
-                received = sorted(ct["chunks"])
-                complete = len(received) == ct["total"]
 
-                if complete:
-                    # 组装文件
-                    full_bin = b""
-                    for i in range(ct["total"]):
-                        cp = os.path.join(transfer_dir, f"{i}.chunk")
-                        if not os.path.isfile(cp):
-                            self.send_error_json(400, f"Missing chunk {i}")
-                            return
-                        with open(cp, "rb") as f:
-                            full_bin += f.read()
-
-                    # 编码为 base64 并走正常消息流程
-                    fb64 = base64.b64encode(full_bin).decode()
-                    finfo = dict(ct["info"])
-                    finfo["data"] = fb64
-                    finfo["size"] = len(full_bin)  # 覆盖客户端报的大小
-
-                    if ct["is_image"]:
-                        # 构造 data URI
-                        mime = finfo.get("mime", "image/png")
-                        data_uri = f"data:{mime};base64,{fb64}"
-                        if len(data_uri) > 5 * 1024 * 1024:
-                            # 图片太大走文件模式
-                            msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
-                        else:
-                            msg_id, _ = add_message("image", data_uri, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
-                    else:
-                        msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
-
-                    # 清理分块
+                # 组装：用流式拼接避免再读一遍（chunk 文件已是顺序的，append 即可）
+                assembled_path = os.path.join(transfer_dir, "assembled.bin")
+                total_size = 0
+                try:
+                    with open(assembled_path, "wb") as out:
+                        for i in range(ct["total"]):
+                            cp = os.path.join(transfer_dir, f"{i}.chunk")
+                            if not os.path.isfile(cp):
+                                raise FileNotFoundError(f"Missing chunk {i}")
+                            with open(cp, "rb") as f:
+                                while True:
+                                    buf = f.read(1024 * 1024)
+                                    if not buf:
+                                        break
+                                    out.write(buf)
+                                    total_size += len(buf)
+                        out.flush()
+                        os.fsync(out.fileno())
+                except Exception:
                     shutil.rmtree(transfer_dir, ignore_errors=True)
+                    with _chunk_lock:
+                        chunk_transfers.pop(transfer_id, None)
+                    self.send_error_json(400, "Missing or unreadable chunk during assembly")
+                    return
+
+                # 最终 size 校验：实际字节数 vs 上限（C-3 第二道闸）
+                if total_size > MAX_CHUNKED_FILE:
+                    shutil.rmtree(transfer_dir, ignore_errors=True)
+                    with _chunk_lock:
+                        chunk_transfers.pop(transfer_id, None)
+                    self.send_error_json(413, f"File too large (max {MAX_CHUNKED_FILE // (1024*1024)}MB)")
+                    return
+
+                finfo = dict(file_info)
+                finfo["size"] = total_size
+                finfo["path"] = None  # 走文件模式，add_message 会写入 TEMP_DIR 并改写 path
+
+                if is_image:
+                    mime = finfo.get("mime", "image/png")
+                    approx_b64 = (total_size + 2) // 3 * 4
+                    if approx_b64 + len(mime) + len("data:;base64,") > 5 * 1024 * 1024:
+                        with open(assembled_path, "rb") as f:
+                            finfo["bytes"] = f.read()
+                        msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+                    else:
+                        import base64 as _b64
+                        with open(assembled_path, "rb") as f:
+                            data_uri = f"data:{mime};base64,{_b64.b64encode(f.read()).decode()}"
+                        msg_id, _ = add_message("image", data_uri, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+                else:
+                    # H-1: 内存直传，避免双重 base64 / 1.5GB 峰值
+                    with open(assembled_path, "rb") as f:
+                        finfo["bytes"] = f.read()
+                    msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
+
+                # 收尾：删分块目录 + 摘条目
+                shutil.rmtree(transfer_dir, ignore_errors=True)
+                with _chunk_lock:
                     chunk_transfers.pop(transfer_id, None)
 
-                    self.send_json(200, {"ok": True, "received": received, "complete": True, "msg_id": msg_id})
-                else:
-                    self.send_json(200, {"ok": True, "received": received, "complete": False})
+                self.send_json(200, {"ok": True, "received": received, "complete": True, "msg_id": msg_id})
                 return  # 分块模式直接返回，不走后续逻辑
             # --- 分块模式结束 ---
 
@@ -2735,41 +2946,73 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # H-5: 预检：仅当请求 Origin 命中允许列表时回显，否则一律拒绝
+        origin = self.headers.get("Origin")
+        if origin and self._origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+        else:
+            self.send_header("Access-Control-Allow-Origin", "null")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", "0")
         self.end_headers()
         self.wfile.flush()
 
+    @staticmethod
+    def _origin_allowed(origin: str) -> bool:
+        """仅允许同主机或 localhost 的 Origin，跨域一律拒绝（H-5）。"""
+        if not origin:
+            return False
+        try:
+            host = urlparse(origin).hostname
+        except Exception:
+            return False
+        if not host:
+            return False
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return True
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            return False
+
 
 def kill_old_instance(port):
-    """检查端口是否被旧的飞递进程占用，是则自动终止。不会误杀其他程序。"""
+    """检查端口是否被旧的飞递进程占用，是则自动终止。不会误杀其他程序（H-7：精确匹配）。"""
+    feidi_names = {"feidi.exe", "feidi-macos", "feidi", "transfer.exe", "transfer.py"}
     try:
         if sys.platform == "win32":
-            # Windows: netstat + tasklist
+            # Windows: netstat + tasklist（按 ImageName 精确匹配）
             r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=5)
             for line in r.stdout.splitlines():
                 if f":{port}" in line and "LISTENING" in line:
                     parts = line.strip().split()
                     pid = parts[-1]
-                    r2 = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=5)
-                    if "python" in r2.stdout.lower() or "feidi" in r2.stdout.lower():
+                    r2 = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                                        capture_output=True, text=True, timeout=5)
+                    first_line = (r2.stdout.splitlines() or [""])[0]
+                    image = first_line.split(",", 1)[0].strip().strip('"').lower()
+                    if image in feidi_names:
                         subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, timeout=5)
-                        print(f"  \033[90m已终止旧的飞递进程 (PID: {pid})\033[0m")
+                        print(f"  \033[90m已终止旧的飞递进程 (PID: {pid}, {image})\033[0m")
                         time.sleep(0.5)
                         return True
         else:
-            # macOS / Linux: lsof + ps
+            # macOS / Linux: lsof + ps 提取 argv[0]
             r = subprocess.run(["lsof", "-ti:%d" % port], capture_output=True, text=True, timeout=5)
             for pid in r.stdout.strip().split():
                 if not pid:
                     continue
-                r2 = subprocess.run(["ps", "-p", pid, "-o", "command="], capture_output=True, text=True, timeout=3)
-                cmd = r2.stdout.strip()
-                if "transfer.py" in cmd or "Feidi" in cmd:
+                r2 = subprocess.run(["ps", "-p", pid, "-o", "comm="], capture_output=True, text=True, timeout=3)
+                comm = r2.stdout.strip().lower()
+                r3 = subprocess.run(["ps", "-p", pid, "-o", "command="], capture_output=True, text=True, timeout=3)
+                cmd = r3.stdout.strip().lower()
+                # 优先精确 argv0；comm 也可能截断，再看完整 command 是否包含 transfer.py / Feidi
+                argv0 = cmd.split()[0] if cmd else ""
+                if comm in feidi_names or argv0 in feidi_names or "transfer.py" in cmd or "/feidi" in cmd:
                     os.kill(int(pid), signal.SIGTERM)
-                    print(f"  \033[90m已终止旧的飞递进程 (PID: {pid})\033[0m")
+                    print(f"  \033[90m已终止旧的飞递进程 (PID: {pid}, {comm or argv0})\033[0m")
                     time.sleep(0.5)
                     return True
     except Exception:
