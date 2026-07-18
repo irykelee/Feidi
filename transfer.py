@@ -122,6 +122,10 @@ LOCAL_IP = None  # 缓存，首次调用 get_local_ip() 后填充
 messages = []
 # 图片消息的文件路径: {msg_id: (bin_path, mime_path)}
 MSG_FILES = {}
+# 文件级引用计数：{msg_id: (ref_count, entry_paths)}，由 _acquire_file /
+# _release_file 维护，防止淘汰与下载竞态（H-3）。所有读写都在 _file_ref_lock 下。
+_file_refs: dict = {}
+_file_ref_lock = threading.Lock()
 CHUNK_SIZE_LIMIT = 2 * 1024 * 1024  # 单块最大 2MB (base64 后 ~2.7MB JSON)
 MAX_CHUNKED_FILE = 500 * 1024 * 1024  # 最大 500MB
 MAX_MESSAGES = 200
@@ -331,13 +335,66 @@ def get_local_ip():
     return LOCAL_IP
 
 
+# H-3: 文件级引用计数。_file_refs[msg_id] = (ref_count, entry_paths)。
+# entry_paths 在第一次 acquire 时从 MSG_FILES 快照，淘汰可能摘 MSG_FILES 但不会
+# 影响 entry_paths。_release_file 在 ref==0 时按 entry_paths 真删盘。
+# 所有读写都在 _file_ref_lock 下。
+def _acquire_file(msg_id):
+    """下载入口：ref+1，返回 entry 路径元组。已被淘汰/未注册返回 None。
+       M-1: 直接返回快照的 entry，handler 无需再读 MSG_FILES，关闭 TOCTOU 窗口。"""
+    with _file_ref_lock:
+        if msg_id not in MSG_FILES:
+            return None
+        entry = MSG_FILES[msg_id]
+        cur = _file_refs.get(msg_id)
+        if cur is None:
+            _file_refs[msg_id] = (1, entry)
+        else:
+            _file_refs[msg_id] = (cur[0] + 1, cur[1])
+        return entry
+
+
+def _release_file(msg_id):
+    """下载出口：ref-1。归零时按记录的 entry 真删盘。"""
+    with _file_ref_lock:
+        cur = _file_refs.get(msg_id)
+        if cur is None:
+            return  # 二次 release 安全
+        refs, entry = cur
+        refs -= 1
+        if refs > 0:
+            _file_refs[msg_id] = (refs, entry)
+            return
+        # refs == 0 → 真删盘
+        _file_refs.pop(msg_id, None)
+        if entry:
+            for p in entry:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass  # best-effort
+
+
 def _cleanup_msg_files(msg_id):
-    """清理指定消息 ID 关联的临时文件"""
-    entry = MSG_FILES.pop(msg_id, None)
-    if entry:
-        for p in entry:
-            if os.path.exists(p):
-                os.remove(p)
+    """淘汰时只在无 in-flight 引用时才删盘；有引用时仅摘 MSG_FILES（拒绝新下载），
+       盘留给 _release_file。与 _acquire_file / _release_file 共享同一把锁。"""
+    with _file_ref_lock:
+        cur = _file_refs.get(msg_id)
+        if cur is not None and cur[0] > 0:
+            # 仍有下载在进行；只摘 MSG_FILES 索引（new acquire → 404），盘留给 _release_file
+            MSG_FILES.pop(msg_id, None)
+            return
+        # 无引用，直接摘 + 删
+        _file_refs.pop(msg_id, None)
+        entry = MSG_FILES.pop(msg_id, None)
+        if entry:
+            for p in entry:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass  # best-effort
 
 
 def check_rate_limit(client_ip):
@@ -2380,6 +2437,11 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 class RequestHandler(BaseHTTPRequestHandler):
     """HTTP 请求处理器"""
 
+    # H-3 follow-up H-1: socket-level read timeout，防止慢客户端把 worker 线程
+    # 永久卡在 copyfileobj 里、把 _file_refs 占住让淘汰失效。timeout 触发后
+    # handler 抛 socket.timeout，被 finally 的 _release_file 兜底释放。
+    timeout = 30
+
     def log_message(self, format, *args):
         pass
 
@@ -2506,30 +2568,34 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not re.match(r'^[a-f0-9-]+$', img_id):
                 self.send_error_body(400, "Invalid image id")
                 return
-            bin_path = os.path.join(TEMP_DIR, f"img_{img_id}.bin")
-            mime_path = os.path.join(TEMP_DIR, f"img_{img_id}.mime")
-            if not os.path.isfile(bin_path):
+            # H-3: 下载入口 ref+1 + 快照 entry（关闭 TOCTOU 窗口）
+            entry = _acquire_file(img_id)
+            if entry is None:
                 self.send_error_body(404, "Not Found")
                 return
-            with open(mime_path, "r", encoding="utf-8") as f:
-                mime = f.read().strip()
-            # C-4: 强校验 image/* 白名单，阻止 SVG/HTML 走 image 路径执行同源 JS
-            if not re.match(r'^image/(png|jpe?g|gif|webp|bmp)$', mime, re.IGNORECASE):
-                self.send_error_body(415, f"Unsupported image type: {mime}")
-                return
-            fsize = os.path.getsize(bin_path)
-            self.send_response(200)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Disposition", 'attachment; filename="image"')  # 防 XSS 走 iframe
-            self.send_header("Content-Length", str(fsize))
-            self.send_header("Cache-Control", "no-store")
-            # H-5: 拒绝跨域读图（避免外部页面 fetch 后渲染）
-            self.send_header("Access-Control-Allow-Origin", "null")
-            self.end_headers()
-            # H-2: 流式复制
-            with open(bin_path, "rb") as f:
-                shutil.copyfileobj(f, self.wfile, 64 * 1024)
-            self.wfile.flush()
+            try:
+                bin_path, mime_path = entry
+                with open(mime_path, "r", encoding="utf-8") as f:
+                    mime = f.read().strip()
+                # C-4: 强校验 image/* 白名单，阻止 SVG/HTML 走 image 路径执行同源 JS
+                if not re.match(r'^image/(png|jpe?g|gif|webp|bmp)$', mime, re.IGNORECASE):
+                    self.send_error_body(415, f"Unsupported image type: {mime}")
+                    return
+                fsize = os.path.getsize(bin_path)
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Disposition", 'attachment; filename="image"')  # 防 XSS 走 iframe
+                self.send_header("Content-Length", str(fsize))
+                self.send_header("Cache-Control", "no-store")
+                # H-5: 拒绝跨域读图（避免外部页面 fetch 后渲染）
+                self.send_header("Access-Control-Allow-Origin", "null")
+                self.end_headers()
+                # H-2: 流式复制
+                with open(bin_path, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, 64 * 1024)
+                self.wfile.flush()
+            finally:
+                _release_file(img_id)
 
         elif path.startswith("/file/"):
             # 下载文件（仅允许 UUID 格式）
@@ -2537,31 +2603,35 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not re.match(r'^[a-f0-9-]+$', file_id):
                 self.send_error_body(400, "Invalid file id")
                 return
-            fpath = os.path.join(TEMP_DIR, f"file_{file_id}.bin")
-            fmeta = os.path.join(TEMP_DIR, f"file_{file_id}.meta.json")
-            if not os.path.isfile(fpath) or not os.path.isfile(fmeta):
+            # H-3: 下载入口 ref+1 + 快照 entry（关闭 TOCTOU 窗口）
+            entry = _acquire_file(file_id)
+            if entry is None:
                 self.send_error_body(404, "Not Found")
                 return
-            with open(fmeta, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            # C-5: filename 去 CRLF / 引号，限制长度
-            raw_name = meta.get("name", "download")
-            safe_name = re.sub(r'[\r\n"\\]', '_', str(raw_name))[:200] or "download"
-            # 仅放行常见二进制 mime，避免任意 Content-Type 误用
-            mime = meta.get("mime", "application/octet-stream")
-            if not re.match(r'^(application|audio|video|text|image|font)/', mime, re.IGNORECASE):
-                mime = "application/octet-stream"
-            fsize = os.path.getsize(fpath)
-            self.send_response(200)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
-            self.send_header("Content-Length", str(fsize))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Access-Control-Allow-Origin", "null")
-            self.end_headers()
-            with open(fpath, "rb") as f:
-                shutil.copyfileobj(f, self.wfile, 64 * 1024)
-            self.wfile.flush()
+            try:
+                fpath, fmeta = entry
+                with open(fmeta, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                # C-5: filename 去 CRLF / 引号，限制长度
+                raw_name = meta.get("name", "download")
+                safe_name = re.sub(r'[\r\n"\\]', '_', str(raw_name))[:200] or "download"
+                # 仅放行常见二进制 mime，避免任意 Content-Type 误用
+                mime = meta.get("mime", "application/octet-stream")
+                if not re.match(r'^(application|audio|video|text|image|font)/', mime, re.IGNORECASE):
+                    mime = "application/octet-stream"
+                fsize = os.path.getsize(fpath)
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+                self.send_header("Content-Length", str(fsize))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "null")
+                self.end_headers()
+                with open(fpath, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, 64 * 1024)
+                self.wfile.flush()
+            finally:
+                _release_file(file_id)
 
         elif path == "/events":
             if len(sse_clients) >= MAX_SSE_CLIENTS:
