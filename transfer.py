@@ -123,7 +123,8 @@ messages = []
 # 图片消息的文件路径: {msg_id: (bin_path, mime_path)}
 MSG_FILES = {}
 # 文件级引用计数：{msg_id: (ref_count, entry_paths)}，由 _acquire_file /
-# _release_file 维护，防止淘汰与下载竞态（H-3）。所有读写都在 _file_ref_lock 下。
+# _release_file 维护，防止淘汰与下载竞态（H-3）。_file_refs 与 MSG_FILES 删除路径
+# 都在 _file_ref_lock 下；MSG_FILES 新增(add_message)在 _msg_lock 下。
 _file_refs: dict = {}
 _file_ref_lock = threading.Lock()
 CHUNK_SIZE_LIMIT = 2 * 1024 * 1024  # 单块最大 2MB (base64 后 ~2.7MB JSON)
@@ -377,6 +378,9 @@ def _release_file(msg_id):
             return
         # refs == 0 → 真删盘
         _file_refs.pop(msg_id, None)
+        # Stage D (C2): 与 _cleanup_msg_files 对称 — 下载结束后同步摘 MSG_FILES，
+        # 否则后续 _acquire_file 仍会返回这个 msg_id 但路径已删，导致 404 之前打开 0 字节。
+        MSG_FILES.pop(msg_id, None)
         if entry:
             for p in entry:
                 try:
@@ -939,10 +943,29 @@ PC_HTML = r"""<!DOCTYPE html>
   var PERSISTENT_ID = "";
   try { PERSISTENT_ID = localStorage.getItem("feidi_pid"); } catch(e) {}
   if (!PERSISTENT_ID) {
-    PERSISTENT_ID = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
-      var r = Math.random() * 16 | 0, v = c === "x" ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
-    });
+    // Stage D (M1): 用 CSPRNG (crypto.getRandomValues) 生成 UUID v4，避免 Math.random()
+    // 可被 LAN 攻击者预测/冒名。
+    try {
+      var _buf = new Uint8Array(16);
+      (window.crypto || window.msCrypto).getRandomValues(_buf);
+      _buf[6] = (_buf[6] & 0x0f) | 0x40; // version 4
+      _buf[8] = (_buf[8] & 0x3f) | 0x80; // variant 1
+      var _hex = Array.prototype.map.call(_buf, function(b) {
+        return (b < 16 ? "0" : "") + b.toString(16);
+      }).join("");
+      PERSISTENT_ID = _hex.substr(0,8) + "-" + _hex.substr(8,4) + "-" + _hex.substr(12,4)
+        + "-" + _hex.substr(16,4) + "-" + _hex.substr(20,12);
+    } catch(_e) {
+      // 极老浏览器降级到 crypto.randomUUID / Math.random（已知不可靠但能跑）
+      if (window.crypto && window.crypto.randomUUID) {
+        PERSISTENT_ID = window.crypto.randomUUID();
+      } else {
+        PERSISTENT_ID = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
+          var r = Math.random() * 16 | 0, v = c === "x" ? r : (r & 0x3 | 0x8);
+          return v.toString(16);
+        });
+      }
+    }
     try { localStorage.setItem("feidi_pid", PERSISTENT_ID); } catch(e) {}
   }
   var MY_HOSTNAME = "电脑";
@@ -1948,10 +1971,27 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   var PERSISTENT_ID = "";
   try { PERSISTENT_ID = localStorage.getItem("feidi_pid"); } catch(e) {}
   if (!PERSISTENT_ID) {
-    PERSISTENT_ID = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
-      var r = Math.random() * 16 | 0, v = c === "x" ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
-    });
+    // Stage D (M1): 用 CSPRNG (crypto.getRandomValues) 生成 UUID v4（对齐 PC 端）
+    try {
+      var _buf = new Uint8Array(16);
+      (window.crypto || window.msCrypto).getRandomValues(_buf);
+      _buf[6] = (_buf[6] & 0x0f) | 0x40;
+      _buf[8] = (_buf[8] & 0x3f) | 0x80;
+      var _hex = Array.prototype.map.call(_buf, function(b) {
+        return (b < 16 ? "0" : "") + b.toString(16);
+      }).join("");
+      PERSISTENT_ID = _hex.substr(0,8) + "-" + _hex.substr(8,4) + "-" + _hex.substr(12,4)
+        + "-" + _hex.substr(16,4) + "-" + _hex.substr(20,12);
+    } catch(_e) {
+      if (window.crypto && window.crypto.randomUUID) {
+        PERSISTENT_ID = window.crypto.randomUUID();
+      } else {
+        PERSISTENT_ID = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
+          var r = Math.random() * 16 | 0, v = c === "x" ? r : (r & 0x3 | 0x8);
+          return v.toString(16);
+        });
+      }
+    }
     try { localStorage.setItem("feidi_pid", PERSISTENT_ID); } catch(e) {}
   }
   var MY_DISPLAY_NAME = "";
