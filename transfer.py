@@ -100,11 +100,15 @@ parser = argparse.ArgumentParser(description="飞递 Feidi — 局域网传输�
 parser.add_argument("--port", type=int, default=9876, help="HTTP 服务端口 (默认 9876)")
 parser.add_argument("--pass", "--password", dest="password", type=str, default="", help="访问密码，为空则不设密码")
 parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
+# Stage G (M4): 自定义绑定地址（默认仅绑定探测到的 LAN IP，避免 0.0.0.0 暴露）
+parser.add_argument("--bind", dest="bind", type=str, default="",
+                    help="绑定地址，留空仅绑定局域网 IP；显式传 0.0.0.0 监听所有网卡")
 args = parser.parse_args()
 
 PORT = args.port
 PASSWORD = args.password or os.environ.get("FEIDI_PASSWORD", "")
 NO_BROWSER = args.no_browser
+BIND_HOST = args.bind  # Stage G (M4)
 TEMP_DIR = tempfile.mkdtemp(prefix="feidi_")
 CHUNK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feidi_chunks")
 
@@ -164,6 +168,8 @@ _server_stop_event = threading.Event()  # 干净关闭清理线程的信号
 # 身份持久化: {identity_key: {device_id, name, hostname, last_ip, mac, type, first_seen, last_seen}}
 IDENTITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feidi_identities.json")
 identity_map = {}
+# Stage G (H1): identity_map 加锁 — 之前跨 handler / SSE 重连并发读写 race
+_identity_lock = threading.Lock()
 _server_hostname = socket.gethostname()
 
 
@@ -182,11 +188,14 @@ def load_identities():
 
 
 def save_identities():
-    """原子写：写到 .tmp 再 os.replace，防止断电时 JSON 截断。"""
+    """原子写：写到 .tmp 再 os.replace，防止断电时 JSON 截断。
+    Stage G (H1): 持 _identity_lock 拍快照，避免与 SSE handshake 写竞态。"""
     tmp = IDENTITY_FILE + ".tmp"
     try:
+        with _identity_lock:
+            snapshot = json.dumps(identity_map, ensure_ascii=False, indent=2)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(identity_map, f, ensure_ascii=False, indent=2)
+            f.write(snapshot)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, IDENTITY_FILE)
@@ -206,16 +215,30 @@ def _hash_mac(mac: str) -> str:
     return hashlib.sha256(salt + mac.upper().encode("utf-8")).hexdigest()[:16]
 
 
+# Stage G (M5): get_mac 结果缓存，避免每次 SSE 重连都跑 arp 子进程
+_mac_cache: dict = {}  # ip -> (raw_mac_or_None, expire_ts)
+_MAC_CACHE_TTL = 300  # 5 分钟
+
+
 def get_mac(ip):
-    """尝试通过 arp 表获取指定 IP 的 MAC 地址（原始值，调用方负责哈希）。"""
+    """尝试通过 arp 表获取指定 IP 的 MAC 地址（原始值，调用方负责哈希）。
+    Stage G (M5): 加 5 分钟缓存，避免反复 SSE 重连跑 subprocess。"""
+    if ip in ("127.0.0.1", "::1"):
+        return None
+    now = time.time()
+    cached = _mac_cache.get(ip)
+    if cached is not None and cached[1] > now:
+        return cached[0]  # 可能缓存 None（探测失败），避免重复探
+    result = None
     try:
-        result = subprocess.run(["arp", "-a", ip], capture_output=True, text=True, timeout=3)
-        match = re.search(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", result.stdout)
+        proc = subprocess.run(["arp", "-a", ip], capture_output=True, text=True, timeout=3)
+        match = re.search(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", proc.stdout)
         if match:
-            return match.group(0).replace("-", ":").upper()
+            result = match.group(0).replace("-", ":").upper()
     except Exception:
         pass
-    return None
+    _mac_cache[ip] = (result, now + _MAC_CACHE_TTL)
+    return result
 
 
 load_identities()
@@ -2848,7 +2871,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif path.startswith("/img/"):
             # 服务图片二进制文件（仅允许 UUID 格式，防路径穿越）
             img_id = path[5:]
-            if not re.match(r'^[a-f0-9-]+$', img_id):
+            if not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$', img_id):
                 self.send_error_body(400, "Invalid image id")
                 return
             # H-3: 下载入口 ref+1 + 快照 entry（关闭 TOCTOU 窗口）
@@ -2883,7 +2906,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif path.startswith("/file/"):
             # 下载文件（仅允许 UUID 格式）
             file_id = path[6:]
-            if not re.match(r'^[a-f0-9-]+$', file_id):
+            if not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$', file_id):
                 self.send_error_body(400, "Invalid file id")
                 return
             # H-3: 下载入口 ref+1 + 快照 entry（关闭 TOCTOU 窗口）
@@ -2917,9 +2940,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 _release_file(file_id)
 
         elif path == "/events":
-            if len(sse_clients) >= MAX_SSE_CLIENTS:
-                self.send_error_body(503, "Too many connections")
-                return
+            # Stage G (M7): SSE 容量检查移入锁内，避免并发穿透
+            with _sse_lock:
+                if len(sse_clients) >= MAX_SSE_CLIENTS:
+                    self.send_error_body(503, "Too many connections")
+                    return
 
             # H-5: SSE 拒绝跨域读取（无 Origin 表示 native / 同源；外部 Origin 一律拒绝）
             origin = self.headers.get("Origin")
@@ -2930,9 +2955,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             # 解析设备信息
             params = parse_qs(parsed.query)
             dev_type = params.get("type", ["unknown"])[0]
-            dev_name = params.get("name", [dev_type])[0]
             if dev_type not in ("pc", "mobile"):
                 dev_type = "unknown"
+            # Stage G (M2): dev_name 长度上限（与 /rename 一致），防持久化 JSON DoS
+            dev_name = params.get("name", [dev_type])[0].strip()[:20]
 
             # 身份绑定：客户端传入 persistent_id 做身份 key
             client_ip = self.client_address[0]
@@ -3469,7 +3495,7 @@ def main():
     kill_old_instance(PORT)
 
     try:
-        server = ThreadingHTTPServer(("0.0.0.0", PORT), RequestHandler)
+        server = ThreadingHTTPServer((BIND_HOST or get_local_ip(), PORT), RequestHandler)
         # 配置 TCP keepalive，快速检测断开的连接
         server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if sys.platform == "darwin":
