@@ -1,6 +1,6 @@
 # 飞递 Feidi
 
-> 局域网文本/图片/文件互传工具 — 纯 Python 标准库，零 pip 依赖，关闭即焚。
+> 局域网文本/图片/文件互传工具 — 零 pip 运行时依赖（QR 库随仓库内置），关闭即焚。
 
 ## 特性
 
@@ -66,12 +66,14 @@ python3 transfer.py
 
 ```
 Feidi/
-├── transfer.py            # 主程序（单文件，零依赖）
+├── transfer.py            # 主程序（单文件）
+├── qrcode_lib/            # 内置 QR 库（vendored，无需 pip）
 ├── build.spec             # Windows PyInstaller 打包配置
 ├── build_mac.spec         # macOS PyInstaller 打包配置
 ├── start.sh               # macOS/Linux 启动脚本
 ├── start.bat              # Windows 启动脚本
 ├── allow_firewall.bat     # Windows 防火墙放行脚本
+├── requirements-build.txt # 仅构建时依赖（pyinstaller）
 └── .github/workflows/     # GitHub Actions 自动构建
 ```
 

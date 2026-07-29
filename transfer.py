@@ -1218,6 +1218,18 @@ PC_HTML = r"""<!DOCTYPE html>
   var seenMsgs = new Set();
   var evtSource = new EventSource("/events?type=" + MY_TYPE + "&pid=" + encodeURIComponent(PERSISTENT_ID) + "&name=" + encodeURIComponent(MY_HOSTNAME) + (MY_DISPLAY_NAME ? "&my_name=" + encodeURIComponent(MY_DISPLAY_NAME) : ""));
 
+  // 密码保护开启时：SSE 被 403 关闭，弹登录框（对齐 MOBILE_HTML L1965-1974 行为）
+  evtSource.onerror = function(e) {
+    if (evtSource.readyState === EventSource.CLOSED) {
+      fetch("/status").then(function(r) {
+        if (r.status === 403) {
+          var ov = document.getElementById("loginOverlay");
+          if (ov) ov.style.display = "flex";
+        }
+      }).catch(function(){});
+    }
+  };
+
   evtSource.addEventListener("device_id", function(e) {
     var data = JSON.parse(e.data);
     MY_ID = data.device_id;
@@ -1669,7 +1681,50 @@ PC_HTML = r"""<!DOCTYPE html>
   setupFileInput(otherInput);
 
 })();
+
+// 密码登录：暴露到 window 以便 onclick 调用，对齐 MOBILE_HTML L2175-2191
+window.doLogin = function() {
+  var pwInput = document.getElementById("passwordInput");
+  var errEl = document.getElementById("loginError");
+  var ov = document.getElementById("loginOverlay");
+  if (!pwInput || !ov) return;
+  var pw = pwInput.value.trim();
+  if (!pw) return;
+  fetch("/login", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({password: pw})
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.ok) {
+      ov.style.display = "none";
+      location.reload();
+    } else {
+      if (errEl) errEl.style.display = "block";
+      pwInput.value = "";
+    }
+  }).catch(function() {
+    if (errEl) errEl.style.display = "block";
+  });
+};
+
+// 回车键提交
+document.addEventListener("keydown", function(e) {
+  if (e.key === "Enter" && document.activeElement && document.activeElement.id === "passwordInput") {
+    window.doLogin();
+  }
+});
 </script>
+
+<!-- 密码登录遮罩（Stage B / C4）：与 MOBILE_HTML loginOverlay 同结构 -->
+<div class="login-overlay" id="loginOverlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center">
+  <div style="background:#fff;border-radius:16px;padding:24px;width:280px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.2)">
+    <div style="font-size:16px;font-weight:600;color:#3b82f6;margin-bottom:16px">飞递 Feidi</div>
+    <div style="font-size:13px;color:#666;margin-bottom:12px">请输入访问密码</div>
+    <input type="password" id="passwordInput" placeholder="密码" style="width:100%;padding:10px 14px;border:1px solid #ddd;border-radius:10px;font-size:15px;outline:none;text-align:center;margin-bottom:12px;box-sizing:border-box">
+    <button onclick="doLogin()" style="width:100%;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:10px;font-size:15px;cursor:pointer">连接</button>
+    <div id="loginError" style="color:#e53935;font-size:12px;margin-top:8px;display:none">密码错误</div>
+  </div>
+</div>
 </body>
 </html>
 """
