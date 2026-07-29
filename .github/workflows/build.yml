@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Stage v1.1.0+: 手动 push tag 触发正式 release (push-on-tag 仍 prerelease)
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -17,7 +21,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install -r requirements-build.txt
-      # H-8: 用 spec 打包，spec 已包含 qrcode_lib datas + hiddenimports
+      # H-8: 用 spec 打包，spec 已包含 qrcode_lib datas + hidden imports
       - run: pyinstaller --noconfirm --clean build.spec
       - name: 上传到 Actions（actions/upload-artifact 会把 .exe 标记为可执行）
         uses: actions/upload-artifact@v4
@@ -48,6 +52,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Tag-triggered 正式 release（从 push-on-tag 触发）；nightly 仍由 push-on-main 触发
   release:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
@@ -61,11 +66,25 @@ jobs:
       # B7: 生成 SHA256SUMS 与产物同发
       - name: 生成校验和
         run: sha256sum Feidi.exe Feidi-macos.zip > SHA256SUMS
+      - name: 决定 tag / title
+        id: tag
+        # Tag 形式如 refs/tags/v1.1.0 → tag_name=v1.1.0
+        # 非 tag (push on main) → tag_name=nightly-<sha>
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag_name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "title=Feidi ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=nightly-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "title=Nightly build ${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
-          # B1: tag 改用 nightly-<sha>，避免反复覆盖
-          tag_name: nightly-${{ github.sha }}
-          name: Nightly build ${{ github.sha }}
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: ${{ steps.tag.outputs.title }}
+          generate_release_notes: true
           body: |
             自动构建于 ${{ github.sha }}
 
@@ -78,8 +97,10 @@ jobs:
             ```bash
             sha256sum -c SHA256SUMS
             ```
+
+            详细变更请见 [CHANGELOG.md](https://github.com/irykelee/Feidi/blob/main/CHANGELOG.md)。
           files: |
             Feidi.exe
             Feidi-macos.zip
             SHA256SUMS
-          prerelease: true
+          prerelease: ${{ steps.tag.outputs.prerelease }}

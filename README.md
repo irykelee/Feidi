@@ -2,6 +2,8 @@
 
 > 局域网文本/图片/文件互传工具 — 零 pip 运行时依赖（QR 库随仓库内置），关闭即焚。
 
+[English](README.en.md) · [更新日志](CHANGELOG.md) · [发布流程](docs/RELEASE_PUSH_CHECKLIST.md)
+
 ## 特性
 
 - 🌐 **纯局域网** — 数据不经过外网，安全私密
