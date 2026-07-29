@@ -426,6 +426,33 @@ def check_rate_limit(client_ip):
     return True
 
 
+def _is_device_online(device_id):
+    """Stage C：检查 SSE 客户端是否在线（私有 chat 离线目标前置检查，避免 ghost message 残留）。"""
+    if not device_id:
+        return False
+    with _sse_lock:
+        for c in sse_clients:
+            if c.get("device_id") == device_id:
+                return True
+    return False
+
+
+def _history_for_device(device_id):
+    """Stage C：私聊历史过滤。返回该设备应看到的历史：
+       - 广播消息 (无 target_id) — 所有人可见
+       - 以此 device 为私聊目标的 (target_id == device_id)
+       - 自己发出的消息 (device_id == self)
+       其余私聊历史(发给别人的)严格不返回。
+    """
+    with _msg_lock:
+        return [
+            m for m in messages
+            if "target_id" not in m
+            or m.get("target_id") == device_id
+            or m.get("device_id") == device_id
+        ]
+
+
 def add_message(msg_type, data, sender, device_name="", device_id="", target_id=None):
     """添加消息并通知所有 SSE 客户端。target_id 为 None 则广播，否则仅发送给指定设备。发送者始终排除。"""
     msg_id = str(uuid.uuid4())
@@ -2788,7 +2815,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 self.wfile.write(f"event: device_id\ndata: {json.dumps({'device_id': device_id, 'name': dev_name, 'type': dev_type, 'server_hostname': _server_hostname, 'identity_key': identity_key}, ensure_ascii=False)}\n\n".encode("utf-8"))
                 self.wfile.flush()
-                history = json.dumps(messages, ensure_ascii=False)
+                history = json.dumps(_history_for_device(device_id), ensure_ascii=False)
                 self.wfile.write(f"event: history\ndata: {history}\n\n".encode("utf-8"))
                 self.wfile.flush()
             except Exception:
@@ -2880,6 +2907,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             dev_name = data.get("device_name", "")
             dev_id = data.get("device_id", "")
             target_id = data.get("target_id", None)  # None = 广播, str = 私聊目标
+
+            # Stage C (C1 续): 私聊目标离线前置检查 — 避免消息 append 后才发现离线而残留
+            if target_id and not _is_device_online(target_id):
+                self.send_error_json(404, "目标设备不在线")
+                return
 
             # --- 分块传输模式 ---
             if "chunk_index" in data and "total_chunks" in data and "transfer_id" in data:
