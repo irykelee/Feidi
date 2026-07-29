@@ -141,10 +141,18 @@ _sse_lock = threading.Lock()
 _msg_lock = threading.Lock()
 # 分块传输: transfer_id -> {chunks: set, total: int, info: dict, created: timestamp, sender, device_name, device_id, target_id}
 chunk_transfers = {}
+# Stage F (F4): 已完成的 transfer_id -> msg_id；重发同 transfer_id 时直接返回缓存，
+# 避免重复 add_message 产生幽灵消息。守护 _chunk_lock。
+completed_transfers: dict = {}
 # 保护 chunk_transfers 的所有读写（包括 set.add、dict 覆盖、组装读 ct、删除）。BaseHTTPRequestHandler 在 ThreadingMixIn 线程中并发执行。
 _chunk_lock = threading.Lock()
 # 最大并发分块传输数（防止恶意客户端无限发起 transfer 撑爆内存 / 磁盘）
 MAX_CONCURRENT_TRANSFERS = 100
+# Stage F (F3/H8): 全局 in-flight 字节配额。一个 500MB 文件在装配期需要约 1.5GB 临时
+# 磁盘（chunks + assembled + final copy），并发多文件时此上限防止 OOM/OOS。
+MAX_GLOBAL_INFLIGHT_BYTES = 500 * 1024 * 1024
+_inflight_bytes = 0
+_inflight_lock = threading.Lock()
 
 # --- 时序常量（曾散落在函数中,Stage A 集中）---
 STALE_CHUNK_TIMEOUT = 600       # 单个分块传输超时未活动即清理（秒）
@@ -224,19 +232,113 @@ def _ensure_chunk_dir():
     os.makedirs(CHUNK_DIR, exist_ok=True)
 
 
+def _save_chunk_state(transfer_id):
+    """Stage F (F6): 把 chunk_transfers 状态原子写到 feidi_chunks/<id>.state.json，
+    供下次启动恢复，浏览器刷新后可断点续传。"""
+    with _chunk_lock:
+        ct = chunk_transfers.get(transfer_id)
+        if not ct:
+            return
+        snapshot = {
+            "chunks": sorted(ct["chunks"]),
+            "total": ct["total"],
+            "bytes_received": ct.get("bytes_received", 0),
+            "info": ct.get("info", {}),
+            "sender": ct.get("sender", ""),
+            "device_name": ct.get("device_name", ""),
+            "device_id": ct.get("device_id", ""),
+            "target_id": ct.get("target_id"),
+            "is_image": ct.get("is_image", False),
+            "last_activity": ct.get("last_activity", time.time()),
+        }
+    path = os.path.join(CHUNK_DIR, transfer_id + ".state.json")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _load_chunk_states():
+    """Stage F (F6): 启动时扫描 feidi_chunks/*.state.json 恢复 in-flight 传输。
+    7 天前的状态文件视为陈旧直接删除。"""
+    if not os.path.isdir(CHUNK_DIR):
+        return
+    now = time.time()
+    seven_days = 7 * 86400
+    loaded = 0
+    for name in os.listdir(CHUNK_DIR):
+        if not name.endswith(".state.json"):
+            continue
+        path = os.path.join(CHUNK_DIR, name)
+        try:
+            mtime = os.path.getmtime(path)
+            if now - mtime > seven_days:
+                os.remove(path)
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            tid = name[: -len(".state.json")]
+            # 校验必需字段
+            chunks = set(state.get("chunks", []))
+            total = int(state.get("total", 0))
+            if not chunks or total <= 0:
+                continue
+            with _chunk_lock:
+                chunk_transfers[tid] = {
+                    "chunks": chunks,
+                    "total": total,
+                    "info": state.get("info", {}),
+                    "bytes_received": int(state.get("bytes_received", 0)),
+                    "sender": state.get("sender", "unknown"),
+                    "device_name": state.get("device_name", ""),
+                    "device_id": state.get("device_id", ""),
+                    "target_id": state.get("target_id"),
+                    "is_image": bool(state.get("is_image", False)),
+                    "last_activity": float(state.get("last_activity", now)),
+                    "created": float(state.get("last_activity", now)),
+                    "assembling": False,
+                }
+                # 计入 in-flight 配额
+                with _inflight_lock:
+                    _inflight_bytes += chunk_transfers[tid]["bytes_received"]
+            loaded += 1
+        except (OSError, ValueError, json.JSONDecodeError):
+            # 损坏的状态文件直接删
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    if loaded:
+        print(f"[feidi] recovered {loaded} chunk transfer(s) from disk", flush=True)
+
+
 def _cleanup_stale_chunks(force=False):
-    """清理过期分块（默认超过 STALE_CHUNK_TIMEOUT 秒未活动的清理）。force=True 时不发通知（用于退出清理）。"""
+    """清理过期分块（默认超过 STALE_CHUNK_TIMEOUT 秒未活动的清理）。force=True 时不发通知（用于退出清理）。
+    Stage F (F2): 持 _chunk_lock，基于 last_activity 而非 created。
+    Stage F (F3): 清理时同步扣减全局 in-flight 字节。"""
     now = time.time()
     timeout = 0 if force else STALE_CHUNK_TIMEOUT
     dead = []
-    for tid, ct in list(chunk_transfers.items()):
-        if force or (now - ct.get("created", now)) > timeout:
-            dead.append((tid, ct))
+    with _chunk_lock:
+        for tid, ct in list(chunk_transfers.items()):
+            last_act = ct.get("last_activity", ct.get("created", now))
+            if force or (now - last_act) > timeout:
+                dead.append((tid, ct))
+        for tid, ct in dead:
+            chunk_transfers.pop(tid, None)
+            completed_transfers.pop(tid, None)
+            # Stage F (F3): 同步扣减 in-flight
+            with _inflight_lock:
+                _inflight_bytes = max(0, _inflight_bytes - ct.get("bytes_received", 0))
     for tid, ct in dead:
         cp = os.path.join(CHUNK_DIR, tid)
         if os.path.isdir(cp):
             shutil.rmtree(cp, ignore_errors=True)
-        chunk_transfers.pop(tid, None)
         # 超时通知发送者和接收者
         if not force:
             fname = ct.get("info", {}).get("name", "未知文件") if isinstance(ct.get("info"), dict) else "未知文件"
@@ -269,10 +371,11 @@ def _cleanup_old_temp_files():
 
 
 def _startup_cleanup():
-    """启动时清理上次运行残留的分块目录"""
+    """启动时清理上次运行残留的分块目录（仅清 *目录*；state.json 文件由 _load_chunk_states 处理）。"""
     if os.path.isdir(CHUNK_DIR):
         for d in os.listdir(CHUNK_DIR):
             dp = os.path.join(CHUNK_DIR, d)
+            # state.json 文件留给 _load_chunk_states 处理；只删目录残留
             if os.path.isdir(dp):
                 try:
                     shutil.rmtree(dp, ignore_errors=True)
@@ -2722,6 +2825,26 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif path == "/status":
             self.send_json(200, {"connections": len(sse_clients), "messages": len(messages)})
 
+        elif path.startswith("/upload/status/"):
+            # Stage F (F6): 客户端断点续传查询 — 返回已收到的 chunk 索引列表与 total。
+            upload_id = path[len("/upload/status/"):]
+            if not re.match(r'^[a-zA-Z0-9\-_]+$', upload_id):
+                self.send_error_body(400, "Invalid transfer_id")
+                return
+            with _chunk_lock:
+                ct = chunk_transfers.get(upload_id)
+                if not ct:
+                    # 也查 completed_transfers（F4）
+                    done = completed_transfers.get(upload_id)
+                    if done:
+                        self.send_json(200, {"ok": True, "complete": True, "msg_id": done})
+                        return
+                    self.send_error_body(404, "Transfer not found")
+                    return
+                received = sorted(ct["chunks"])
+                total = ct["total"]
+            self.send_json(200, {"ok": True, "complete": False, "received": received, "total": total})
+
         elif path.startswith("/img/"):
             # 服务图片二进制文件（仅允许 UUID 格式，防路径穿越）
             img_id = path[5:]
@@ -2829,21 +2952,37 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # Stage E: 即使身份复用，session_token 每次握手也是新 token
                 # （旧连接 token 失效，新连接必须从 SSE event: device_id 取新值）
                 session_token = secrets.token_hex(16)
+
+                # Stage F (F5/H6): IP/MAC 校验 — 已知身份在换设备/IP 时拒绝
+                # （article 飞递开发记_重写的版本.md 第 114-121 行承诺过 "IP 或 MAC
+                # 对不上的话，不认"；此前从未实现）。
+                old_ip = info.get("last_ip")
+                old_mac = info.get("mac")
+                current_mac_hash = None
+                if client_ip not in ("127.0.0.1", "::1"):
+                    raw_mac = get_mac(client_ip)
+                    if raw_mac:
+                        current_mac_hash = _hash_mac(raw_mac)
+                # 本机测试 (loopback) 不强制 IP 校验；LAN 设备 IP 漂移是常态，
+                # 若 last_ip 存在且不同则警告；MAC 严格（哈希必须匹配）
+                if old_ip and old_ip != client_ip and client_ip not in ("127.0.0.1", "::1"):
+                    print(f"[feidi] identity '{identity_key[:8]}' IP changed {old_ip} -> {client_ip}; accepting (LAN roaming)", flush=True)
+                if old_mac and current_mac_hash and old_mac != current_mac_hash:
+                    print(f"[feidi] identity '{identity_key[:8]}' MAC hash mismatch; refusing impersonation", flush=True)
+                    self.send_error_body(403, "MAC mismatch for known identity")
+                    return
+
                 if my_name:
                     dev_name = my_name
                     info["name"] = my_name
                 else:
                     dev_name = info.get("name", dev_name or dev_type)
                 # 更新元数据
-                old_ip = info.get("last_ip")
                 info["last_ip"] = client_ip
                 info["last_seen"] = int(time.time())
                 info["type"] = dev_type
-                # 尝试获取 MAC（如果是新 IP）
-                if old_ip != client_ip and client_ip not in ("127.0.0.1", "::1"):
-                    mac = get_mac(client_ip)
-                    if mac:
-                        info["mac"] = _hash_mac(mac)  # M-5: 不再明文
+                if current_mac_hash:
+                    info["mac"] = current_mac_hash
             else:
                 device_id = str(uuid.uuid4())[:8]
                 # Stage E (H2/H10): 每个 SSE 连接发独立 128-bit session token，
@@ -3000,6 +3139,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 total_chunks = int(data["total_chunks"])
                 transfer_id = str(data["transfer_id"]).strip()
                 chunk_b64 = data.get("chunk_data", "")
+
+                # Stage F (F4): 同一 transfer_id 已完成则返回缓存的 msg_id，跳过整个
+                # chunk 处理路径，避免重复 add_message 产生重复消息。
+                with _chunk_lock:
+                    cached_msg_id = completed_transfers.get(transfer_id)
+                if cached_msg_id:
+                    self.send_json(200, {"ok": True, "received": [], "complete": True, "msg_id": cached_msg_id, "duplicate": True})
+                    return
+
                 if not transfer_id or not re.match(r'^[a-zA-Z0-9\-_]+$', transfer_id):
                     self.send_error_json(400, "Invalid transfer_id")
                     return
@@ -3057,10 +3205,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                         # 另一个线程已经判定 complete 并开始组装；这个请求视为重复 ACK
                         self.send_json(200, {"ok": True, "complete": True, "duplicate": True})
                         return
+                    # Stage F (F1): 仅在 chunk_index 首次出现时累计 bytes_received，
+                    # 避免重试 chunk 导致 size 虚高、超 MAX_CHUNKED_FILE 限。
+                    is_new_chunk = chunk_index not in ct["chunks"]
+                    # Stage F (F3): 全局字节配额。检查 + 增加原子（持 _inflight_lock）。
+                    if is_new_chunk:
+                        with _inflight_lock:
+                            if _inflight_bytes + len(chunk_bin) > MAX_GLOBAL_INFLIGHT_BYTES:
+                                self.send_error_json(503, "Global inflight byte quota exceeded")
+                                return
+                            _inflight_bytes += len(chunk_bin)
                     ct["chunks"].add(chunk_index)
                     received = sorted(ct["chunks"])
-                    estimated_size = ct.get("bytes_received", 0) + len(chunk_bin)
-                    ct["bytes_received"] = estimated_size
+                    if is_new_chunk:
+                        ct["bytes_received"] = ct.get("bytes_received", 0) + len(chunk_bin)
+                    # Stage F (F2): 每次 chunk POST 刷新 last_activity，cleanup 基于此而非 created
+                    ct["last_activity"] = time.time()
+                    estimated_size = ct.get("bytes_received", 0)
                     if estimated_size > MAX_CHUNKED_FILE:
                         # 拒绝路径：清盘 + 摘条目 + 写盘仍在锁内所以安全
                         chunk_transfers.pop(transfer_id, None)
@@ -3087,6 +3248,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     f.write(chunk_bin)
                     f.flush()
                     os.fsync(f.fileno())
+
+                # Stage F (F6): 落盘后写 state.json，让重启/刷新可断点续传
+                _save_chunk_state(transfer_id)
 
                 if not complete:
                     self.send_json(200, {"ok": True, "received": received, "complete": False})
@@ -3150,6 +3314,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 shutil.rmtree(transfer_dir, ignore_errors=True)
                 with _chunk_lock:
                     chunk_transfers.pop(transfer_id, None)
+                    # Stage F (F4): 缓存完成状态，幂等接收重发请求
+                    completed_transfers[transfer_id] = msg_id
+                    # Stage F (F3): 扣减 in-flight
+                    with _inflight_lock:
+                        _inflight_bytes = max(0, _inflight_bytes - ct.get("bytes_received", 0))
 
                 self.send_json(200, {"ok": True, "received": received, "complete": True, "msg_id": msg_id})
                 return  # 分块模式直接返回，不走后续逻辑
@@ -3330,6 +3499,8 @@ def main():
     try:
         # 启动过期分块清理线程（每 CLEANUP_INTERVAL 秒清理一次）
         _startup_cleanup()
+        # Stage F (F6): 启动时恢复 in-flight 分块传输（按 7 天 TTL 过滤）
+        _load_chunk_states()
         cleanup_thread = threading.Thread(target=_periodic_cleanup_loop, daemon=True)
         cleanup_thread.start()
         server.serve_forever()
