@@ -567,6 +567,22 @@ def _is_device_online(device_id):
     return False
 
 
+# Stage i18n: 探测 URL ?lang= 参数，返回 "zh" / "en"（默认 zh）。客户端
+# 用 localStorage 在 JS 端覆盖。服务器只设 <html lang=""> 属性 + data-server-lang。
+_LANG_DEFAULT = "zh"
+
+
+def _pick_lang(query_string=""):
+    import re as _re
+    if query_string:
+        m = _re.search(r"(?:^|[&;])lang=([a-zA-Z-]+)", query_string)
+        if m:
+            v = m.group(1).lower().split("-")[0]
+            if v in ("zh", "en"):
+                return v
+    return _LANG_DEFAULT
+
+
 def _check_session_token(token):
     """Stage E (H2/H10): 在 sse_clients 中按 token 反查 device_id。"""
     if not token:
@@ -757,7 +773,7 @@ SVG = {
 
 # --- PC 端 HTML（完全离线，QR 码由服务端 SVG 直接嵌入） ---
 PC_HTML = r"""<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="__LANG__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -945,6 +961,7 @@ PC_HTML = r"""<!DOCTYPE html>
     <div class="status-row">
       <span class="status-dot offline" id="statusDot"></span>
       <span class="status-text" id="statusText">等待手机连接</span>
+      <span style="margin-left:auto;font-size:12px;opacity:.6"><a href="#" onclick="window.__setLang('zh');return false" style="color:inherit;text-decoration:none" data-i18n-active="zh">中</a> | <a href="#" onclick="window.__setLang('en');return false" style="color:inherit;text-decoration:none" data-i18n-active="en">EN</a></span>
     </div>
     <div class="messages" id="messages">
       <div class="empty-state" id="emptyState">
@@ -1869,6 +1886,39 @@ PC_HTML = r"""<!DOCTYPE html>
   setupFileInput(docInput);
   setupFileInput(otherInput);
 
+  // Stage i18n: 客户端语种切换 (服务器在 <html lang> 提供初始值,localStorage 覆盖)
+  (function() {
+    var I18N = {
+      zh: {
+        devices: "在线设备", messages: "条消息", connect: "连接", password: "密码",
+        wrongPassword: "密码错误", enterPassword: "请输入访问密码",
+        offline: "目标设备不在线", noDevice: "暂无设备连接,无法发送", sendFail: "发送失败,请检查连接"
+      },
+      en: {
+        devices: "Devices", messages: "messages", connect: "Connect", password: "Password",
+        wrongPassword: "Wrong password", enterPassword: "Enter access password",
+        offline: "Target device offline", noDevice: "No devices online", sendFail: "Send failed, check connection"
+      }
+    };
+    function applyI18n(lang) {
+      if (!I18N[lang]) lang = "zh";
+      var dict = I18N[lang];
+      document.querySelectorAll("[data-i18n]").forEach(function(el) {
+        var key = el.getAttribute("data-i18n");
+        if (dict[key]) el.textContent = dict[key];
+      });
+      document.documentElement.setAttribute("lang", lang === "zh" ? "zh-Hans" : "en");
+    }
+    var stored = null;
+    try { stored = localStorage.getItem("feidi_lang"); } catch(e) {}
+    var current = stored || document.documentElement.lang || "zh";
+    if (!I18N[current]) current = "zh";
+    applyI18n(current);
+    window.__setLang = function(lang) {
+      try { localStorage.setItem("feidi_lang", lang); } catch(e) {}
+      applyI18n(lang);
+    };
+  })();
 })();
 
 // 密码登录：暴露到 window 以便 onclick 调用，对齐 MOBILE_HTML L2175-2191
@@ -1920,6 +1970,7 @@ document.addEventListener("keydown", function(e) {
 
 # 用 SVG 图标替换所有占位符
 PC_HTML = (PC_HTML
+    .replace("__LANG__", "zh")  # 占位,运行时由 send_html 的 _pick_lang 覆盖
     .replace("__ICON_SEND__", SVG["send"])
     .replace("__ICON_IMAGE__", SVG["image"])
     .replace("__ICON_FILE__", SVG["file"])
@@ -1938,7 +1989,7 @@ PC_HTML = (PC_HTML
 
 # --- 手机端 HTML ---
 MOBILE_HTML = r"""<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="__LANG__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -2035,7 +2086,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div class="header">飞递 Feidi<button class="devices-btn" id="devicesBtn" onclick="toggleSidebar()"><span style="font-size:13px">&#x1F4F1;</span><span class="db-count" id="deviceCountBadge">0</span></button><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">__ICON_MOON__</button><div class="sub">手机端</div></div>
+<div class="header">飞递 Feidi<button class="devices-btn" id="devicesBtn" onclick="toggleSidebar()"><span style="font-size:13px">&#x1F4F1;</span><span class="db-count" id="deviceCountBadge">0</span></button><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">__ICON_MOON__</button><span style="font-size:11px;opacity:.7;margin-left:auto"><a href="#" onclick="window.__setLang('zh');return false" style="color:inherit;text-decoration:none">中</a>|<a href="#" onclick="window.__setLang('en');return false" style="color:inherit;text-decoration:none">EN</a></span><div class="sub">手机端</div></div>
 <div class="status-bar connected" id="statusBar">
   <span class="dot green"></span><span>已连接</span>
 </div>
@@ -2683,6 +2734,36 @@ MOBILE_HTML = r"""<!DOCTYPE html>
       break;
     }
   });
+
+  // Stage i18n: 客户端语种切换
+  (function() {
+    var I18N = {
+      zh: { devices: "在线设备", messages: "条消息", connect: "连接", password: "密码",
+            wrongPassword: "密码错误", enterPassword: "请输入访问密码",
+            offline: "目标设备不在线", noDevice: "暂无设备连接,无法发送", sendFail: "发送失败,请检查连接" },
+      en: { devices: "Devices", messages: "messages", connect: "Connect", password: "Password",
+            wrongPassword: "Wrong password", enterPassword: "Enter access password",
+            offline: "Target device offline", noDevice: "No devices online", sendFail: "Send failed, check connection" }
+    };
+    function applyI18n(lang) {
+      if (!I18N[lang]) lang = "zh";
+      var dict = I18N[lang];
+      document.querySelectorAll("[data-i18n]").forEach(function(el) {
+        var key = el.getAttribute("data-i18n");
+        if (dict[key]) el.textContent = dict[key];
+      });
+      document.documentElement.setAttribute("lang", lang === "zh" ? "zh-Hans" : "en");
+    }
+    var stored = null;
+    try { stored = localStorage.getItem("feidi_lang"); } catch(e) {}
+    var current = stored || document.documentElement.lang || "zh";
+    if (!I18N[current]) current = "zh";
+    applyI18n(current);
+    window.__setLang = function(lang) {
+      try { localStorage.setItem("feidi_lang", lang); } catch(e) {}
+      applyI18n(lang);
+    };
+  })();
 })();
 </script>
 </body>
@@ -2691,6 +2772,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
 
 # 用 SVG 图标替换所有占位符
 MOBILE_HTML = (MOBILE_HTML
+    .replace("__LANG__", "zh")  # 占位,运行时由 send_html 的 _pick_lang 覆盖
     .replace("__ICON_SEND__", SVG["send"])
     .replace("__ICON_CAMERA__", SVG["camera"])
     .replace("__ICON_MOON__", SVG["moon"])
@@ -2790,12 +2872,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             if PASSWORD:
                 mobile_url += "?auth=required"
             qr_svg = generate_qr_svg(mobile_url)
-            html_content = PC_HTML.replace("__QR_SVG__", qr_svg).replace("__MOBILE_URL__", mobile_url)
+            # Stage i18n: 服务器探测语言,设入 <html lang> 属性供 JS 读取
+            lang = _pick_lang(parsed.query)
+            html_content = (PC_HTML
+                .replace("__QR_SVG__", qr_svg)
+                .replace("__MOBILE_URL__", mobile_url)
+                .replace("__LANG__", lang))
             self.send_html(html_content)
             return
 
         if path == "/mobile":
-            self.send_html(MOBILE_HTML)
+            # Stage i18n: 注入 <html lang>
+            lang = _pick_lang(parsed.query)
+            self.send_html(MOBILE_HTML.replace("__LANG__", lang))
             return
 
         if not self.check_password():

@@ -14,7 +14,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<!-- 尚未发布的变更 -->
+### Added / 新增
+
+- **UI language toggle (zh / en)** / **UI 双语切换 (中 / EN)**
+  - **ZH**: 状态栏右上角加 `中 | EN` 切换按钮,选择存 `localStorage`;首次访问根据 URL `?lang=` 选择;客户端 JS 字典即时替换 `data-i18n` 标注的字符串。服务器端 `_pick_lang(query)` 探测初始语言。
+  - **EN**: `中 | EN` switcher in status bar; choice persisted in `localStorage`; first-visit lang from URL `?lang=`; client-side JS dictionary swaps `data-i18n` strings on load. Server-side `_pick_lang(query)` picks initial lang.
+  - 当前覆盖关键错误/状态字符串(密码、登录、连接、设备、离线);完整字符串翻译留待后续 PR。
+
+### Changed / 变更
+
+- **README 双语化** / **README bilingual**: `README.md` (zh) + `README.en.md` (en),互相链向
+- **`<html lang>` 改为 `__LANG__` 占位符**,运行时由服务器注入;客户端 JS 也会刷新该属性
+
+### Infrastructure / 基础设施
+
+- **正式 release 流程** / **Formal release process** (对齐 ClipMemory):
+  - `CHANGELOG.md` 双语 Keep-a-Changelog 格式
+  - `docs/RELEASE_PUSH_CHECKLIST.md` 5 段勾选清单 (A/B/C/D/E)
+  - `docs/release-notes-template.md` 模板
+  - `Scripts/pre_push_verify.sh` 本地预检查脚本
+  - `.github/workflows/build.yml`: push → nightly, tag `v*` → 正式 release (prerelease=false)
+  - pre-commit hook 收紧: `password` 字段收窄为字面量匹配;非交互场景自动放行
+  - release `89feefa` + `1f6c77e` 落地;`v1.1.0` 已发布 (8 个 audit-fix commit + 文档基础设施)
+
+---
+
+## [1.1.0] - 2026-07-29 — Security & Reliability Audit Remediation / 安全与可靠性审计修复
 
 ## [1.1.0] - 2026-07-29 — Security & Reliability Audit Remediation / 安全与可靠性审计修复
 
