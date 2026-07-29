@@ -187,9 +187,16 @@ def load_identities():
         print(f"[feidi] load_identities: {e}", flush=True)
 
 
-def save_identities():
-    """原子写：写到 .tmp 再 os.replace，防止断电时 JSON 截断。
-    Stage G (H1): 持 _identity_lock 拍快照，避免与 SSE handshake 写竞态。"""
+# L5: 5s debounce — 高频连接/重命名场景下, 5s 内的连续 save_identities() 合并为单次写盘,
+# 避免每次 SSE handshake (rename / 新身份) 都同步全量 JSON 落盘阻塞 worker 线程。
+_SAVE_IDENTITIES_DEBOUNCE = 5.0
+_identities_save_timer = None  # type: threading.Timer | None
+
+
+def _save_identities_flush():
+    """实际写盘内部函数; 调度由 save_identities() 负责。"""
+    global _identities_save_timer
+    _identities_save_timer = None
     tmp = IDENTITY_FILE + ".tmp"
     try:
         with _identity_lock:
@@ -205,6 +212,18 @@ def save_identities():
                 os.remove(tmp)
         except OSError:
             pass
+
+
+def save_identities():
+    """原子写: 写到 .tmp 再 os.replace, 防止断电时 JSON 截断。
+    Stage G (H1): 持 _identity_lock 拍快照, 避免与 SSE handshake 写竞态。
+    Stage I (L5): 5s debounce — 多次连续调用合并为单次写盘, 不阻塞 SSE handshake 线程。"""
+    global _identities_save_timer
+    if _identities_save_timer is not None:
+        _identities_save_timer.cancel()
+    _identities_save_timer = threading.Timer(_SAVE_IDENTITIES_DEBOUNCE, _save_identities_flush)
+    _identities_save_timer.daemon = True
+    _identities_save_timer.start()
 
 
 def _hash_mac(mac: str) -> str:
@@ -626,9 +645,16 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
     msg_files = None  # (tuple of paths) or None
     if msg_type == "image":
         if data.startswith("data:"):
-            header, b64 = data.split(",", 1)
-            mime = header.split(";")[0][5:]
-            img_bin = base64.b64decode(b64)
+            # M4 修复: 用 partition 替代 split, 缺逗号的非法 data URI 不再 ValueError -> 500
+            header, sep, b64 = data.partition(",")
+            if sep:
+                mime = header.split(";")[0][5:]
+                img_bin = base64.b64decode(b64)
+            else:
+                # 缺逗号 (如 "data:image/png;base64" 无 payload), 降级为空 octet-stream
+                print(f"[feidi] malformed image data URI (no comma), fallback: {header[:40]!r}", file=sys.stderr, flush=True)
+                img_bin = b""
+                mime = "application/octet-stream"
         else:
             img_bin = data if isinstance(data, bytes) else data.encode("utf-8")
             mime = "application/octet-stream"
@@ -2800,7 +2826,11 @@ class RequestHandler(BaseHTTPRequestHandler):
     timeout = SOCKET_TIMEOUT
 
     def log_message(self, format, *args):
-        pass
+        # L7 修复: 输出到 stderr, 至少排障可见; 异常时降级输出原始 format 避免递归
+        try:
+            print(f"[feidi] {format % args}", file=sys.stderr, flush=True)
+        except Exception:
+            print(f"[feidi] {format}", file=sys.stderr, flush=True)
 
     def check_password(self):
         """检查密码 — 通过 Cookie 中的 auth token"""
