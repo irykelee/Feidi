@@ -182,9 +182,9 @@ def load_identities():
             data = json.load(f)
         if isinstance(data, dict):
             identity_map = data
-    except Exception:
-        # 保留旧值，避免断电 / 半写导致全部身份静默丢失
-        pass
+    except Exception as e:
+        # Stage H (L3): 保留旧值但记录错误（断电/半写时仍可恢复），不静默吞
+        print(f"[feidi] load_identities: {e}", flush=True)
 
 
 def save_identities():
@@ -2735,10 +2735,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def set_auth_cookie(self):
         # H-6: HttpOnly 防 JS 读取；plaintext HTTP 不能加 Secure；SameSite=Lax 保持
-        self.send_header(
-            "Set-Cookie",
-            f"feidi_auth={AUTH_TOKEN}; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly",
-        )
+        # Stage H (L8): HTTPS 反代场景下加 Secure
+        cookie = f"feidi_auth={AUTH_TOKEN}; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly"
+        if self.headers.get("X-Forwarded-Proto") == "https":
+            cookie += "; Secure"
+        self.send_header("Set-Cookie", cookie)
 
     def send_html(self, html_content):
         body = html_content.encode("utf-8")
@@ -2918,9 +2919,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 fpath, fmeta = entry
                 with open(fmeta, "r", encoding="utf-8") as f:
                     meta = json.load(f)
-                # C-5: filename 去 CRLF / 引号，限制长度
+                # C-5: filename 去 CRLF / 引号 / 分号，限制长度
                 raw_name = meta.get("name", "download")
-                safe_name = re.sub(r'[\r\n"\\]', '_', str(raw_name))[:200] or "download"
+                safe_name = re.sub(r'[\r\n"\\;]', '_', str(raw_name))[:200] or "download"
+                # Stage H (L10): RFC 5987 filename* 非 ASCII 百分号编码
+                from urllib.parse import quote
+                encoded_name = quote(safe_name, safe='')
                 # 仅放行常见二进制 mime，避免任意 Content-Type 误用
                 mime = meta.get("mime", "application/octet-stream")
                 if not re.match(r'^(application|audio|video|text|image|font)/', mime, re.IGNORECASE):
@@ -2928,7 +2932,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 fsize = os.path.getsize(fpath)
                 self.send_response(200)
                 self.send_header("Content-Type", mime)
-                self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+                self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{encoded_name}')
                 self.send_header("Content-Length", str(fsize))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Access-Control-Allow-Origin", "null")
