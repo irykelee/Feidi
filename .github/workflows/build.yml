@@ -3,11 +3,10 @@ name: 构建
 on:
   push:
     branches: [main]
-  workflow_dispatch:
-  # Stage v1.1.0+: 手动 push tag 触发正式 release (push-on-tag 仍 prerelease)
-  push:
+    # Stage v1.1.0+: 手动 push tag 触发正式 release workflow
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
