@@ -25,8 +25,8 @@
 
 | 平台 | 文件 |
 |------|------|
-| Windows | `Feidi-win.exe` |
-| macOS | `Feidi-macos` |
+| Windows | `Feidi.exe` |
+| macOS | `Feidi-macos.zip` |
 
 双击运行，手机扫二维码即可连接。
 
@@ -77,20 +77,27 @@ Feidi/
 
 ## 自行打包
 
+使用仓库自带的 spec 文件（已包含内置 QR 库与签名/公证配置）：
+
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --name Feidi --console --clean transfer.py
-# 输出在 dist/ 目录
+# Windows
+pyinstaller --noconfirm --clean build.spec
+# macOS
+pyinstaller --noconfirm --clean build_mac.spec
+# 输出在 dist/ 目录（macOS 为 Feidi.app / Windows 为 Feidi.exe）
 ```
 
 ## 安全
 
 - 所有数据仅在局域网内传输，不经过任何外网服务器
 - 图片和文件存储于临时目录，程序退出自动清理
-- 密码认证使用 SHA-256 哈希 + 时序安全比较
+- 密码认证：服务端生成随机 128-bit token，设入 HttpOnly + SameSite=Lax Cookie；密码通过 `secrets.compare_digest` 在 `/login` POST 中做时序安全比较
 - 文件路径 UUID 格式校验，防止路径穿越
-- 内置速率限制（5 req/s/IP）
-- 分块传输含发送者校验，防止数据注入
+- 内置速率限制（5 req/s/IP，`/login` 单独 2 req/s/IP）
+- 分块传输含发送者校验（device_id 比对）
+- SSE 握手下发 per-session bearer token，`/send` 与 `/rename` 需携带（防 device_id 冒名）
+- 已知身份复用时校验 IP/MAC（防换设备盗号）
 
 ## License
 

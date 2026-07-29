@@ -98,7 +98,7 @@ def generate_qr_svg(data, module_px=4, border=4):
 # --- 命令行参数 ---
 parser = argparse.ArgumentParser(description="飞递 Feidi — 局域网传输工具")
 parser.add_argument("--port", type=int, default=9876, help="HTTP 服务端口 (默认 9876)")
-parser.add_argument("--pass", dest="password", type=str, default="", help="访问密码，为空则不设密码")
+parser.add_argument("--pass", "--password", dest="password", type=str, default="", help="访问密码，为空则不设密码")
 parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
 args = parser.parse_args()
 
@@ -144,6 +144,14 @@ chunk_transfers = {}
 _chunk_lock = threading.Lock()
 # 最大并发分块传输数（防止恶意客户端无限发起 transfer 撑爆内存 / 磁盘）
 MAX_CONCURRENT_TRANSFERS = 100
+
+# --- 时序常量（曾散落在函数中,Stage A 集中）---
+STALE_CHUNK_TIMEOUT = 600       # 单个分块传输超时未活动即清理（秒）
+CLEANUP_INTERVAL = 300          # 定期清理线程间隔（秒）；原 1800，但 main() 注释声明"每 5 分钟"
+SOCKET_TIMEOUT = 30             # HTTP handler socket 读超时（秒）；慢客户端卡死防护
+SSE_KEEPALIVE_TIMEOUT = 15      # SSE 队列无事件时多久发一次心跳（秒）
+POST_KILL_GRACE = 0.5           # 杀旧进程后等其释放端口（秒）
+_server_stop_event = threading.Event()  # 干净关闭清理线程的信号
 # 身份持久化: {identity_key: {device_id, name, hostname, last_ip, mac, type, first_seen, last_seen}}
 IDENTITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feidi_identities.json")
 identity_map = {}
@@ -216,9 +224,9 @@ def _ensure_chunk_dir():
 
 
 def _cleanup_stale_chunks(force=False):
-    """清理过期分块（默认超过 10 分钟未完成的清理）。force=True 时不发通知（用于退出清理）。"""
+    """清理过期分块（默认超过 STALE_CHUNK_TIMEOUT 秒未活动的清理）。force=True 时不发通知（用于退出清理）。"""
     now = time.time()
-    timeout = 0 if force else 600
+    timeout = 0 if force else STALE_CHUNK_TIMEOUT
     dead = []
     for tid, ct in list(chunk_transfers.items()):
         if force or (now - ct.get("created", now)) > timeout:
@@ -272,9 +280,11 @@ def _startup_cleanup():
 
 
 def _periodic_cleanup_loop():
-    """定期清理线程：每 30 分钟清理过期的临时文件和分块"""
-    while True:
-        time.sleep(1800)  # 30 分钟
+    """定期清理线程：每 CLEANUP_INTERVAL 秒清理过期的临时文件和分块；收到停止信号即退出。"""
+    while not _server_stop_event.is_set():
+        # wait_for 返回 True 即收到停止信号，提前退出
+        if _server_stop_event.wait(timeout=CLEANUP_INTERVAL):
+            break
         _cleanup_old_temp_files()
         _cleanup_stale_chunks()
 
@@ -2442,7 +2452,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     # H-3 follow-up H-1: socket-level read timeout，防止慢客户端把 worker 线程
     # 永久卡在 copyfileobj 里、把 _file_refs 占住让淘汰失效。timeout 触发后
     # handler 抛 socket.timeout，被 finally 的 _release_file 兜底释放。
-    timeout = 30
+    timeout = SOCKET_TIMEOUT
 
     def log_message(self, format, *args):
         pass
@@ -2514,7 +2524,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             ip = get_local_ip()
             mobile_url = f"http://{ip}:{PORT}/mobile"
             if PASSWORD:
-                mobile_url += f"?code={AUTH_TOKEN[:8]}"
+                mobile_url += "?auth=required"
             qr_svg = generate_qr_svg(mobile_url)
             html_content = PC_HTML.replace("__QR_SVG__", qr_svg).replace("__MOBILE_URL__", mobile_url)
             self.send_html(html_content)
@@ -2736,7 +2746,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 while True:
                     try:
-                        data = dev_info["queue"].get(timeout=15)
+                        data = dev_info["queue"].get(timeout=SSE_KEEPALIVE_TIMEOUT)
                         self.wfile.write(data.encode("utf-8"))
                         self.wfile.flush()
                     except queue.Empty:
@@ -2959,9 +2969,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                             finfo["bytes"] = f.read()
                         msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
                     else:
-                        import base64 as _b64
                         with open(assembled_path, "rb") as f:
-                            data_uri = f"data:{mime};base64,{_b64.b64encode(f.read()).decode()}"
+                            data_uri = f"data:{mime};base64,{base64.b64encode(f.read()).decode()}"
                         msg_id, _ = add_message("image", data_uri, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
                 else:
                     # H-1: 内存直传，避免双重 base64 / 1.5GB 峰值
@@ -3068,7 +3077,7 @@ def kill_old_instance(port):
                     if image in feidi_names:
                         subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, timeout=5)
                         print(f"  \033[90m已终止旧的飞递进程 (PID: {pid}, {image})\033[0m")
-                        time.sleep(0.5)
+                        time.sleep(POST_KILL_GRACE)
                         return True
         else:
             # macOS / Linux: lsof + ps 提取 argv[0]
@@ -3083,9 +3092,14 @@ def kill_old_instance(port):
                 # 优先精确 argv0；comm 也可能截断，再看完整 command 是否包含 transfer.py / Feidi
                 argv0 = cmd.split()[0] if cmd else ""
                 if comm in feidi_names or argv0 in feidi_names or "transfer.py" in cmd or "/feidi" in cmd:
-                    os.kill(int(pid), signal.SIGTERM)
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError) as e:
+                        # 进程在我们查 lsof 之后已经退出/被回收；不算错
+                        print(f"[feidi] kill_old_instance: {e}", flush=True)
+                        continue
                     print(f"  \033[90m已终止旧的飞递进程 (PID: {pid}, {comm or argv0})\033[0m")
-                    time.sleep(0.5)
+                    time.sleep(POST_KILL_GRACE)
                     return True
     except Exception:
         pass
@@ -3097,7 +3111,7 @@ def main():
     url = f"http://{local_ip}:{PORT}"
     mobile_url = url + "/mobile"
     if PASSWORD:
-        mobile_url += f"?code={AUTH_TOKEN[:8]}"
+        mobile_url += "?auth=required"
 
     print("-" * 52)
     print("  飞递 Feidi - 局域网传输工具")
@@ -3105,7 +3119,7 @@ def main():
     print(f"  电脑端:  {url}")
     print(f"  手机端:  {mobile_url}")
     if PASSWORD:
-        print(f"  密码保护: 已启用 (连接码: {AUTH_TOKEN[:8]})")
+        print("  密码保护: 已启用（访问时需输入密码）")
     print(f"  按 Ctrl+C 停止")
     print("-" * 52)
     print("  \033[93m提示:\033[0m 手机扫码后若无法打开，请检查：")
@@ -3140,17 +3154,14 @@ def main():
             sys.exit(1)
         raise
     if not NO_BROWSER:
-        print(f"\n服务已启动，浏览器将自动打开...")
+        print("\n服务已启动，浏览器将自动打开...")
         webbrowser.open(url)
     else:
-        print(f"\n服务已启动")
+        print("\n服务已启动")
 
     try:
-        # 启动过期分块清理线程（每 5 分钟清理一次）
-        import threading
-        # 启动时清理上次残留
+        # 启动过期分块清理线程（每 CLEANUP_INTERVAL 秒清理一次）
         _startup_cleanup()
-        _server_stopped = False
         cleanup_thread = threading.Thread(target=_periodic_cleanup_loop, daemon=True)
         cleanup_thread.start()
         server.serve_forever()
