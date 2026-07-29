@@ -441,6 +441,17 @@ def _is_device_online(device_id):
     return False
 
 
+def _check_session_token(token):
+    """Stage E (H2/H10): 在 sse_clients 中按 token 反查 device_id。"""
+    if not token:
+        return None
+    with _sse_lock:
+        for c in sse_clients:
+            if c.get("session_token") == token:
+                return c.get("device_id")
+    return None
+
+
 def _history_for_device(device_id):
     """Stage C：私聊历史过滤。返回该设备应看到的历史：
        - 广播消息 (无 target_id) — 所有人可见
@@ -904,6 +915,7 @@ PC_HTML = r"""<!DOCTYPE html>
 })();
 (function(){
   var MY_ID = "";
+  var MY_SESSION = "";  // Stage E (H2/H10): SSE 握手下发的 per-session bearer
   var MY_NAME = "";
   var MY_TYPE = "pc";
   const SENDER = "pc";
@@ -1213,7 +1225,7 @@ PC_HTML = r"""<!DOCTYPE html>
           saveMyName(newName);
           MY_NAME = newName;
           // 同步到服务端，所有人可见
-          fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(newName))
+          fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(newName), {headers: {"X-Feidi-Session": MY_SESSION}})
             .then(function(r) { return r.json(); })
             .then(function(d) {
               if (d.name) {
@@ -1283,6 +1295,7 @@ PC_HTML = r"""<!DOCTYPE html>
   evtSource.addEventListener("device_id", function(e) {
     var data = JSON.parse(e.data);
     MY_ID = data.device_id;
+    MY_SESSION = data.session_token || "";  // Stage E
     MY_NAME = data.name;
     MY_TYPE = data.type;
     // 默认私聊：MY_ID 就绪后补选第一台非本机设备
@@ -1292,7 +1305,7 @@ PC_HTML = r"""<!DOCTYPE html>
     }
     // 如果有本地自命名，同步到服务端
     if (MY_DISPLAY_NAME && MY_DISPLAY_NAME !== data.name) {
-      fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(MY_DISPLAY_NAME));
+      fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(MY_DISPLAY_NAME), {headers: {"X-Feidi-Session": MY_SESSION}});
     }
   });
 
@@ -1414,7 +1427,7 @@ PC_HTML = r"""<!DOCTYPE html>
     var textTarget = selectedDevice || null;
     fetch("/send", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
       body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: textTarget})
     }).then(function(r) { return r.json(); }).then(function(data) {
       if (!data.ok) throw new Error("发送失败");
@@ -1492,7 +1505,7 @@ PC_HTML = r"""<!DOCTYPE html>
         } else {
           fetch("/send", {
             method: "POST",
-            headers: {"Content-Type": "application/json"},
+            headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
             body: JSON.stringify({image: dataUri, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
           }).then(function(r) { return r.json(); }).then(function(d) {
             if (!d.ok) throw new Error("发送失败");
@@ -1603,7 +1616,7 @@ PC_HTML = r"""<!DOCTYPE html>
 
         fetch("/send", {
           method: "POST",
-          headers: {"Content-Type": "application/json"},
+          headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
           body: JSON.stringify(body)
         }).then(function(r) { return r.json(); }).then(function(data) {
           if (data.ok && data.received) {
@@ -1693,7 +1706,7 @@ PC_HTML = r"""<!DOCTYPE html>
           var imgDataUri = reader.result;
           fetch("/send", {
             method: "POST",
-            headers: {"Content-Type": "application/json"},
+            headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
             body: JSON.stringify({image: imgDataUri, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
           }).then(function(r) { return r.json(); }).then(function(data) {
             if (!data.ok) throw new Error("发送失败");
@@ -1742,7 +1755,7 @@ window.doLogin = function() {
   if (!pw) return;
   fetch("/login", {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
     body: JSON.stringify({password: pw})
   }).then(function(r) { return r.json(); }).then(function(data) {
     if (data.ok) {
@@ -1999,6 +2012,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   var remarks = {};
   try { remarks = JSON.parse(localStorage.getItem("feidi_remarks") || "{}"); } catch(e) {}
   var MY_ID = "";
+  var MY_SESSION = "";  // Stage E
   var MY_NAME = "手机";
   var selectedDevice = null;
   var sse_clients_cache = [];
@@ -2042,6 +2056,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   evtSource.addEventListener("device_id", function(e) {
     var data = JSON.parse(e.data);
     MY_ID = data.device_id;
+    MY_SESSION = data.session_token || "";  // Stage E
     MY_NAME = data.name;
     // 默认私聊：MY_ID 就绪后补选第一台非本机设备
     if (!selectedDevice && sse_clients_cache && sse_clients_cache.length > 0) {
@@ -2049,7 +2064,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
       if (others.length > 0) switchConversation(others[0].id);
     }
     if (MY_DISPLAY_NAME && MY_DISPLAY_NAME !== data.name) {
-      fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(MY_DISPLAY_NAME));
+      fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(MY_DISPLAY_NAME), {headers: {"X-Feidi-Session": MY_SESSION}});
     }
   });
 
@@ -2285,7 +2300,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
       if (isMe) {
         saveMyName(v);
         if (v && v !== MY_NAME) {
-          fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(v));
+          fetch("/rename?id=" + encodeURIComponent(MY_ID) + "&name=" + encodeURIComponent(v), {headers: {"X-Feidi-Session": MY_SESSION}});
         }
       } else {
         if (v) { remarks[deviceId] = v; } else { delete remarks[deviceId]; }
@@ -2309,7 +2324,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     if (!pw) return;
     fetch("/login", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
       body: JSON.stringify({password: pw})
     }).then(function(r) { return r.json(); }).then(function(data) {
       if (data.ok) {
@@ -2398,7 +2413,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
         if (isImage) body.image_type = true;
         fetch("/send", {
           method: "POST",
-          headers: {"Content-Type": "application/json"},
+          headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
           body: JSON.stringify(body)
         }).then(function(r) { return r.json(); }).then(function(data) {
           if (data.ok && data.received) {
@@ -2454,7 +2469,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     var textTarget = selectedDevice || null;
     fetch("/send", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
       body: JSON.stringify({text: text, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: textTarget})
     }).then(function(r) { return r.json(); }).then(function(data) {
       if (!data.ok) throw new Error("发送失败");
@@ -2495,7 +2510,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
         reader.onload = function() {
           fetch("/send", {
             method: "POST",
-            headers: {"Content-Type": "application/json"},
+            headers: {"Content-Type": "application/json", "X-Feidi-Session": MY_SESSION},
             body: JSON.stringify({image: reader.result, sender: SENDER, device_name: MY_NAME, device_id: MY_ID, target_id: selectedDevice || null})
           }).then(function(r) { return r.json(); }).then(function(data) {
             if (!data.ok) throw new Error("发送失败");
@@ -2672,6 +2687,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_error_json(400, "Name cannot be empty")
                 return
 
+            # Stage E (H2/H10): session token 校验 — 不允许只凭 body 里的 device_id
+            # 改别人名字；必须是持有该 device_id 对应 session token 的 SSE 客户端
+            session_token = self.headers.get("X-Feidi-Session", "")
+            session_dev_id = _check_session_token(session_token)
+            if not session_dev_id:
+                self.send_error_json(401, "Missing or invalid session token")
+                return
+            if session_dev_id != dev_id:
+                self.send_error_json(403, "device_id does not match session")
+                return
+
             # 通过 device_id 匹配（device_id 在 SSE 握手时分配，非公开）
             renamed = False
             with _sse_lock:
@@ -2800,6 +2826,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             if identity_key in identity_map:
                 info = identity_map[identity_key]
                 device_id = info["device_id"]
+                # Stage E: 即使身份复用，session_token 每次握手也是新 token
+                # （旧连接 token 失效，新连接必须从 SSE event: device_id 取新值）
+                session_token = secrets.token_hex(16)
                 if my_name:
                     dev_name = my_name
                     info["name"] = my_name
@@ -2817,6 +2846,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                         info["mac"] = _hash_mac(mac)  # M-5: 不再明文
             else:
                 device_id = str(uuid.uuid4())[:8]
+                # Stage E (H2/H10): 每个 SSE 连接发独立 128-bit session token，
+                # 客户端后续 /send /rename 必须带 X-Feidi-Session: <token>，
+                # 否则服务端不信任请求中的 device_id，避免 LAN 攻击者冒名发消息。
+                session_token = secrets.token_hex(16)
                 dev_name = my_name or dev_name or dev_type
                 raw_mac = get_mac(client_ip) if client_ip not in ("127.0.0.1", "::1") else None
                 mac = _hash_mac(raw_mac) if raw_mac else None
@@ -2832,7 +2865,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 }
             save_identities()
 
-            dev_info = {"queue": queue.Queue(), "device_id": device_id, "name": dev_name, "type": dev_type, "identity_key": identity_key}
+            dev_info = {"queue": queue.Queue(), "device_id": device_id, "name": dev_name, "type": dev_type, "identity_key": identity_key, "session_token": session_token}
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -2853,7 +2886,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             # 发送设备身份和消息历史
             try:
-                self.wfile.write(f"event: device_id\ndata: {json.dumps({'device_id': device_id, 'name': dev_name, 'type': dev_type, 'server_hostname': _server_hostname, 'identity_key': identity_key}, ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.write(f"event: device_id\ndata: {json.dumps({'device_id': device_id, 'name': dev_name, 'type': dev_type, 'server_hostname': _server_hostname, 'identity_key': identity_key, 'session_token': session_token}, ensure_ascii=False)}\n\n".encode("utf-8"))
                 self.wfile.flush()
                 history = json.dumps(_history_for_device(device_id), ensure_ascii=False)
                 self.wfile.write(f"event: history\ndata: {history}\n\n".encode("utf-8"))
@@ -2928,6 +2961,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             client_ip = self.client_address[0]
             if not check_rate_limit(client_ip):
                 self.send_error_json(429, "Too many requests")
+                return
+
+            # Stage E (H2/H10): session token 必须先于 body 解析检查，
+            # 减少无效请求的 CPU 开销（100MB body 在拒绝前不必读）。
+            session_token = self.headers.get("X-Feidi-Session", "")
+            session_dev_id = _check_session_token(session_token)
+            if not session_dev_id:
+                self.send_error_body(401, "Missing or invalid session token")
                 return
 
             content_length = int(self.headers.get("Content-Length", 0))
