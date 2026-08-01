@@ -795,10 +795,13 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
                 f.write(fbin)
                 f.flush()
                 os.fsync(f.fileno())
+            fsize = len(fbin)
+        # D-05：必须先写完整 JSON 再 flush + fsync（旧实现顺序反了：
+        # 先 fsync 空文件、再 json.dump，崩溃窗口下 meta 为空/截断）。
         with open(fmeta, "w", encoding="utf-8") as f:
+            json.dump({"name": fname, "size": fsize, "mime": fmime}, f, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-            json.dump({"name": fname, "size": fsize, "mime": fmime}, f, ensure_ascii=False)
         msg_files = (fpath, fmeta)
         msg["data"] = {"name": fname, "size": fsize, "mime": fmime, "path": f"/file/{msg_id}"}
     else:
