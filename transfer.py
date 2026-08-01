@@ -3045,11 +3045,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_error_json(404, "Device not found")
                 return
 
-            # 持久化到 identity_map
-            for ikey, info in identity_map.items():
-                if info.get("device_id") == dev_id:
-                    info["name"] = new_name
-                    break
+            # 持久化到 identity_map（C-06：持 _identity_lock，避免与 SSE 握手并发写
+            # 触发 RuntimeError: dictionary changed size during iteration）
+            with _identity_lock:
+                for ikey, info in identity_map.items():
+                    if info.get("device_id") == dev_id:
+                        info["name"] = new_name
+                        break
             save_identities()
             broadcast_device_list()
             self.send_json(200, {"ok": True, "name": new_name})
@@ -3210,17 +3212,20 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_body(403, "MAC mismatch for known identity")
                     return
 
-                if my_name:
-                    dev_name = my_name
-                    info["name"] = my_name
-                else:
-                    dev_name = info.get("name", dev_name or dev_type)
-                # 更新元数据
-                info["last_ip"] = client_ip
-                info["last_seen"] = int(time.time())
-                info["type"] = dev_type
-                if current_mac_hash:
-                    info["mac"] = current_mac_hash
+                # C-06：更新已知身份字段必须持 _identity_lock，避免与 /rename 遍历、
+                # _save_identities_flush 的快照并发 race（之前仅快照读持锁，写路径裸奔）。
+                with _identity_lock:
+                    if my_name:
+                        dev_name = my_name
+                        info["name"] = my_name
+                    else:
+                        dev_name = info.get("name", dev_name or dev_type)
+                    # 更新元数据
+                    info["last_ip"] = client_ip
+                    info["last_seen"] = int(time.time())
+                    info["type"] = dev_type
+                    if current_mac_hash:
+                        info["mac"] = current_mac_hash
             else:
                 device_id = str(uuid.uuid4())[:8]
                 # Stage E (H2/H10): 每个 SSE 连接发独立 128-bit session token，
@@ -3230,19 +3235,32 @@ class RequestHandler(BaseHTTPRequestHandler):
                 dev_name = my_name or dev_name or dev_type
                 raw_mac = get_mac(client_ip) if client_ip not in ("127.0.0.1", "::1") else None
                 mac = _hash_mac(raw_mac) if raw_mac else None
-                identity_map[identity_key] = {
-                    "device_id": device_id,
-                    "name": dev_name,
-                    "hostname": dev_name,
-                    "last_ip": client_ip,
-                    "mac": mac,
-                    "type": dev_type,
-                    "first_seen": int(time.time()),
-                    "last_seen": int(time.time()),
-                }
+                # C-06：新增身份写入必须持 _identity_lock
+                with _identity_lock:
+                    identity_map[identity_key] = {
+                        "device_id": device_id,
+                        "name": dev_name,
+                        "hostname": dev_name,
+                        "last_ip": client_ip,
+                        "mac": mac,
+                        "type": dev_type,
+                        "first_seen": int(time.time()),
+                        "last_seen": int(time.time()),
+                    }
             save_identities()
 
-            dev_info = {"queue": queue.Queue(), "device_id": device_id, "name": dev_name, "type": dev_type, "identity_key": identity_key, "session_token": session_token}
+            # R-05：队列有上限（慢消费堆积到上限后广播侧会剔除该客户端）；
+            # cancel 事件用于重连时取消旧连接；wfile 引用用于重连时主动断开旧 TCP。
+            dev_info = {
+                "queue": queue.Queue(maxsize=SSE_QUEUE_MAX),
+                "device_id": device_id,
+                "name": dev_name,
+                "type": dev_type,
+                "identity_key": identity_key,
+                "session_token": session_token,
+                "cancel": threading.Event(),
+                "wfile": self.wfile,
+            }
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
