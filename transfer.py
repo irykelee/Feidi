@@ -652,13 +652,33 @@ def _pick_lang(query_string=""):
 
 
 def _check_session_token(token):
-    """Stage E (H2/H10): 在 sse_clients 中按 token 反查 device_id。"""
+    """在 sse_clients 中按 token 反查 device_id。"""
     if not token:
         return None
     with _sse_lock:
         for c in sse_clients:
             if c.get("session_token") == token:
                 return c.get("device_id")
+    return None
+
+
+def _session_identity(token):
+    """通过 session token 反查 (device_id, name, type)；供 /send 等端点
+    把发送者身份唯一来源限制到 SSE registry，避免 body 伪造（S-01）。
+
+    返回 dict 或 None（无效/过期 token）。调用方须在持有锁的状态下使用
+    返回值之前再校验一次，但 identity 字段不会再变。"""
+    if not token:
+        return None
+    with _sse_lock:
+        for c in sse_clients:
+            if c.get("session_token") == token:
+                return {
+                    "device_id": c.get("device_id", ""),
+                    "name": c.get("name", ""),
+                    "type": c.get("type", "unknown"),
+                    "identity_key": c.get("identity_key", ""),
+                }
     return None
 
 
@@ -3305,14 +3325,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             # Stage E (H2/H10): session token 必须先于 body 解析检查，
             # 减少无效请求的 CPU 开销（100MB body 在拒绝前不必读）。
             session_token = self.headers.get("X-Feidi-Session", "")
-            session_dev_id = _check_session_token(session_token)
-            if not session_dev_id:
+            # S-01：从 session 派生全部发送者身份（device_id/name/sender），
+            # body 提供的身份字段必须与 session 一致，否则 403。
+            sess = _session_identity(session_token)
+            if not sess:
                 self.send_error_body(401, "Missing or invalid session token")
                 return
 
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > MAX_BODY_SIZE:
-                self.send_error_json(413, "Request too large")
+            content_length = _parse_content_length(self.headers, max_allowed=MAX_BODY_SIZE)
+            if content_length is None:
+                # C-05：非法 Content-Length 直接 400，避免 int() 抛 500
+                self.send_error_json(400, "Invalid or missing Content-Length")
                 return
             body = self.rfile.read(content_length)
             try:
