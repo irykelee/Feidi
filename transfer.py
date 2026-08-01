@@ -775,6 +775,16 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
                 f.flush()
                 os.fsync(f.fileno())
             fsize = len(file_info["bytes"])
+        elif "src_path" in file_info and os.path.isfile(file_info["src_path"]):
+            # R-06：分块组装完成文件已在磁盘上，直接 move/link 到最终路径，避免整块读内存。
+            # 组装阶段已 fsync；move 后再次 fsync 保险（同盘 rename 极快，跨盘回退 copy）。
+            try:
+                os.replace(file_info["src_path"], fpath)
+            except OSError:
+                shutil.copyfile(file_info["src_path"], fpath)
+            fsize = os.path.getsize(fpath)
+            with open(fpath, "rb") as f:
+                os.fsync(f.fileno())
         else:
             fb64 = file_info.get("data", "")
             try:
@@ -3639,23 +3649,22 @@ class RequestHandler(BaseHTTPRequestHandler):
 
                 finfo = dict(file_info)
                 finfo["size"] = total_size
-                finfo["path"] = None  # 走文件模式，add_message 会写入 TEMP_DIR 并改写 path
 
                 if is_image:
                     mime = finfo.get("mime", "image/png")
                     approx_b64 = (total_size + 2) // 3 * 4
                     if approx_b64 + len(mime) + len("data:;base64,") > 5 * 1024 * 1024:
-                        with open(assembled_path, "rb") as f:
-                            finfo["bytes"] = f.read()
+                        # R-06：大图经 src_path 交给 add_message 移动落盘，不再整块读内存
+                        finfo["src_path"] = assembled_path
                         msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
                     else:
                         with open(assembled_path, "rb") as f:
                             data_uri = f"data:{mime};base64,{base64.b64encode(f.read()).decode()}"
                         msg_id, _ = add_message("image", data_uri, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
                 else:
-                    # H-1: 内存直传，避免双重 base64 / 1.5GB 峰值
-                    with open(assembled_path, "rb") as f:
-                        finfo["bytes"] = f.read()
+                    # R-06：经 src_path 让 add_message 直接 move 组装文件到最终路径，
+                    # 避免 500MB 整块读入内存（峰值仅磁盘一份副本）。
+                    finfo["src_path"] = assembled_path
                     msg_id, _ = add_message("file", finfo, ct["sender"], ct["device_name"], ct["device_id"], ct["target_id"])
 
                 # 收尾：删分块目录 + 摘条目
