@@ -488,10 +488,26 @@ def _periodic_cleanup_loop():
             break
         _cleanup_old_temp_files()
         _cleanup_stale_chunks()
+        # R-04：定期清理过期的 rate-limit 条目；防止字典随时间无限增长。
+        _rate_limits_cleanup()
+
+
+def _flush_identities_on_exit():
+    """D-04/L-02：退出时取消 5s debounce timer 并同步 flush 身份文件，
+    避免改名/新身份后 Ctrl+C 立即退出丢数据。"""
+    global _identities_save_timer
+    if _identities_save_timer is not None:
+        _identities_save_timer.cancel()
+        _identities_save_timer = None
+    try:
+        _save_identities_flush()
+    except Exception:
+        pass
 
 
 def signal_handler(sig, frame):
     print("\n正在关闭...")
+    _flush_identities_on_exit()
     cleanup()
     sys.exit(0)
 
@@ -3909,7 +3925,7 @@ def main():
     except OSError as e:
         if e.errno == 48 or e.errno == 10048:  # Address already in use
             print(f"\n  \033[91m端口 {PORT} 已被占用，且不是飞递进程。\033[0m")
-            print(f"  请手动终止占用进程，或使用 --port 换个端口")
+            print("  请手动终止占用进程，或使用 --port 换个端口")
             sys.exit(1)
         raise
     if not NO_BROWSER:
@@ -3919,17 +3935,21 @@ def main():
         print("\n服务已启动")
 
     try:
-        # 启动过期分块清理线程（每 CLEANUP_INTERVAL 秒清理一次）
-        _startup_cleanup()
-        # Stage F (F6): 启动时恢复 in-flight 分块传输（按 7 天 TTL 过滤）
+        # C-02 修复：必须先 _load_chunk_states（校验 state 与磁盘一致），
+        # 再 _startup_cleanup（清孤儿）。原顺序反过来的话，所有 transfer
+        # 目录在读 state 之前就被无差别删了，导致"resume 是假的"。
         _load_chunk_states()
+        _startup_cleanup()
         cleanup_thread = threading.Thread(target=_periodic_cleanup_loop, daemon=True)
         cleanup_thread.start()
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        _server_stopped = True
+        # L-02：通知清理线程干净退出（旧代码写的是从未定义/读取的 _server_stopped 死变量）
+        _server_stop_event.set()
+        # D-04：退出前同步 flush 身份文件，避免 debounce 期间退出丢数据
+        _flush_identities_on_exit()
         server.server_close()
         print("\n已关闭，临时文件已清理")
 
