@@ -1486,7 +1486,7 @@ PC_HTML = r"""<!DOCTYPE html>
       var selCls = (d.id === selectedDevice) ? " selected" : "";
       var meCls = isMe ? " me" : "";
       var remarkTag = isRemark ? ' <span class="di-badge remark">备注</span>' : '';
-      html += '<div class="device-item' + selCls + meCls + '" id="dev-' + d.id + '" data-device-id="' + d.id + '">' +
+      html += '<div class="device-item' + selCls + meCls + '" id="dev-' + d.id + '" data-device-id="' + d.id + '" role="button" tabindex="0" aria-label="设备 ' + escHtml(displayName) + '">' +
         '<div class="di-avatar" style="background:' + avatarColor + '">' + avatarLetter + '</div>' +
         '<div class="di-info"><div class="di-name' + (isMe ? " editable" : " editable") + '"' + ' onclick="event.stopPropagation();startRename(\'' + d.id + '\')"' + '>' + escHtml(displayName) + (isMe ? ' <span class="di-badge me">本机</span>' : '') + remarkTag + '</div>' +
         '<div class="di-type">' + (d.type === "mobile" ? "手机" : "电脑") + (isRemark ? ' — ' + escHtml(d.name || d.type) : '') + '</div></div>' +
@@ -1510,10 +1510,18 @@ PC_HTML = r"""<!DOCTYPE html>
     dlBody.innerHTML = html;
     // 设备点击：切换会话（非本机）
     dlBody.querySelectorAll(".device-item").forEach(function(el) {
-      el.addEventListener("click", function() {
+      function activate() {
         var did = el.getAttribute("data-device-id");
         if (did === MY_ID) return; // 不能跟自己私聊
         switchConversation(did === selectedDevice ? null : did);
+      }
+      el.addEventListener("click", activate);
+      // A-07：键盘可达（WCAG 2.1.1），Enter/Space 等同点击
+      el.addEventListener("keydown", function(e) {
+        if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+          e.preventDefault();
+          activate();
+        }
       });
     });
     updateStatus(otherCount);
@@ -1601,7 +1609,12 @@ PC_HTML = r"""<!DOCTYPE html>
       fetch("/status").then(function(r) {
         if (r.status === 403) {
           var ov = document.getElementById("loginOverlay");
-          if (ov) ov.style.display = "flex";
+          if (ov) {
+            ov.style.display = "flex";
+            // A-07：登录框弹出后聚焦密码输入（focus trap 第一步）
+            var pw = document.getElementById("passwordInput");
+            if (pw) setTimeout(function() { pw.focus(); }, 0);
+          }
         }
       }).catch(function(){});
     }
@@ -2127,9 +2140,9 @@ document.addEventListener("keydown", function(e) {
 </script>
 
 <!-- 密码登录遮罩（Stage B / C4）：与 MOBILE_HTML loginOverlay 同结构 -->
-<div class="login-overlay" id="loginOverlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center">
+<div class="login-overlay" id="loginOverlay" role="dialog" aria-modal="true" aria-labelledby="loginTitle" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center">
   <div style="background:#fff;border-radius:16px;padding:24px;width:280px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.2)">
-    <div style="font-size:16px;font-weight:600;color:#3b82f6;margin-bottom:16px">飞递 Feidi</div>
+    <div id="loginTitle" style="font-size:16px;font-weight:600;color:#3b82f6;margin-bottom:16px">飞递 Feidi</div>
     <div style="font-size:13px;color:#666;margin-bottom:12px">请输入访问密码</div>
     <input type="password" id="passwordInput" placeholder="密码" style="width:100%;padding:10px 14px;border:1px solid #ddd;border-radius:10px;font-size:15px;outline:none;text-align:center;margin-bottom:12px;box-sizing:border-box">
     <button onclick="doLogin()" style="width:100%;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:10px;font-size:15px;cursor:pointer">连接</button>
@@ -2164,7 +2177,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
 <html lang="__LANG__">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>飞递 Feidi</title>
 <style>
   :root{
@@ -2299,9 +2312,9 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   </div>
   <div class="sb-body" id="sbBody"></div>
 </div>
-<div class="login-overlay" id="loginOverlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:200;display:none;align-items:center;justify-content:center">
+<div class="login-overlay" id="loginOverlay" role="dialog" aria-modal="true" aria-labelledby="loginTitle" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:200;display:none;align-items:center;justify-content:center">
   <div style="background:#fff;border-radius:16px;padding:24px;width:280px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.2)">
-    <div style="font-size:16px;font-weight:600;color:#2e7d32;margin-bottom:16px">飞递 Feidi</div>
+    <div id="loginTitle" style="font-size:16px;font-weight:600;color:#2e7d32;margin-bottom:16px">飞递 Feidi</div>
     <div style="font-size:13px;color:#666;margin-bottom:12px">请输入访问密码</div>
     <input type="password" id="passwordInput" placeholder="密码" style="width:100%;padding:10px 14px;border:1px solid #ddd;border-radius:10px;font-size:15px;outline:none;text-align:center;margin-bottom:12px;box-sizing:border-box">
     <button onclick="doLogin()" style="width:100%;padding:10px;background:#43a047;color:#fff;border:none;border-radius:10px;font-size:15px;cursor:pointer">连接</button>
@@ -2462,9 +2475,12 @@ MOBILE_HTML = r"""<!DOCTYPE html>
     if (evtSource.readyState === EventSource.CLOSED) {
       fetch("/status").then(function(r) {
         if (r.status === 403) {
-          document.getElementById("loginOverlay").style.display = "flex";
+          const ov = document.getElementById("loginOverlay");
+          ov.style.display = "flex";
+          // A-07：登录框弹出后聚焦密码输入
+          if (passwordInput) setTimeout(function() { passwordInput.focus(); }, 0);
         }
-      });
+      }).catch(function(){});
     }
     document.getElementById("statusBar").className = "status-bar disconnected";
     document.getElementById("statusBar").innerHTML = '<span class="dot red"></span><span>连接断开，重连中...</span>';
