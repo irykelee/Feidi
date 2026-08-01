@@ -172,6 +172,10 @@ identity_map = {}
 _identity_lock = threading.Lock()
 _server_hostname = socket.gethostname()
 
+# S-08：允许的 CORS Origin 主机集合（仅本机/局域网实际暴露的 host，避免对任意 IP 反射）。
+# main() 启动时填入 LOCAL_IP / BIND_HOST / hostname；默认仅 localhost。
+_allowed_origin_hosts = {"127.0.0.1", "localhost", "::1"}
+
 
 def load_identities():
     global identity_map
@@ -500,24 +504,37 @@ def get_local_ip():
     if LOCAL_IP is not None:
         return LOCAL_IP
 
-    candidates = []
+    # S-10：默认 bind 候选仅限私网/RFC1918 地址，排除公网地址，
+    # 避免路由器/双网卡环境把服务默认暴露到公网（默认无密码）。
+    private_candidates = []
     try:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
             ip = info[4][0]
             if ip.startswith("127."):
                 continue
-            candidates.append(ip)
+            try:
+                if ipaddress.ip_address(ip).is_private:
+                    private_candidates.append(ip)
+            except ValueError:
+                pass
     except Exception:
         pass
 
     # 如果没有找到，尝试通过创建 UDP socket 来探测（不实际发包）
-    if not candidates:
+    if not private_candidates:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("192.168.1.1", 1))
-            candidates.append(s.getsockname()[0])
+            probe = s.getsockname()[0]
             s.close()
+            # S-10：探测结果同样只接受私网地址，公网探测结果绝不作为默认监听地址
+            if probe and not probe.startswith("127."):
+                try:
+                    if ipaddress.ip_address(probe).is_private:
+                        private_candidates.append(probe)
+                except ValueError:
+                    pass
         except Exception:
             pass
 
@@ -535,8 +552,13 @@ def get_local_ip():
             return 2
         return 3
 
-    candidates.sort(key=ip_priority)
-    LOCAL_IP = candidates[0] if candidates else "127.0.0.1"
+    if private_candidates:
+        private_candidates.sort(key=ip_priority)
+        LOCAL_IP = private_candidates[0]
+    else:
+        # 无私网地址：回退 loopback 并警告，绝不默认监听公网
+        print("  \033[93m警告:\033[0m 未检测到局域网/私网地址，服务仅监听 127.0.0.1（如需局域网访问请用 --bind 指定地址）", flush=True)
+        LOCAL_IP = "127.0.0.1"
     return LOCAL_IP
 
 
@@ -3715,7 +3737,13 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _origin_allowed(origin: str) -> bool:
-        """仅允许同主机或 localhost 的 Origin，跨域一律拒绝（H-5）。"""
+        """仅允许本机/局域网实际 host 的 Origin，跨域一律拒绝（S-08 收紧）。
+
+        旧实现 ipaddress.ip_address(host) 成功即返回 True —— 任意合法 IP（其他 LAN
+        主机、公网 IP）托管的网页都能拿到 Access-Control-Allow-Origin 反射，并可跨域
+        读取 /events SSE。现在只允许 _allowed_origin_hosts 中的主机（由 main() 在
+        启动时填入 LOCAL_IP / BIND_HOST / hostname + localhost）。
+        """
         if not origin:
             return False
         try:
@@ -3724,13 +3752,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False
         if not host:
             return False
-        if host in ("127.0.0.1", "localhost", "::1"):
-            return True
-        try:
-            ipaddress.ip_address(host)
-            return True
-        except ValueError:
-            return False
+        return host in _allowed_origin_hosts
 
 
 def kill_old_instance(port):
@@ -3782,7 +3804,16 @@ def kill_old_instance(port):
 
 
 def main():
+    global _allowed_origin_hosts
     local_ip = get_local_ip()
+    # S-08：把本机实际暴露的 host 加入 CORS 允许列表（网页客户端同源 Origin 才被反射）
+    _allowed_origin_hosts = {"127.0.0.1", "localhost", "::1", local_ip}
+    if BIND_HOST:
+        _allowed_origin_hosts.add(BIND_HOST)
+    try:
+        _allowed_origin_hosts.add(socket.gethostname())
+    except Exception:
+        pass
     url = f"http://{local_ip}:{PORT}"
     mobile_url = url + "/mobile"
     if PASSWORD:
