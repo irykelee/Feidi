@@ -134,6 +134,7 @@ _file_refs: dict = {}
 _file_ref_lock = threading.Lock()
 CHUNK_SIZE_LIMIT = 2 * 1024 * 1024  # 单块最大 2MB (base64 后 ~2.7MB JSON)
 MAX_CHUNKED_FILE = 500 * 1024 * 1024  # 最大 500MB
+COMPLETED_TRANSFERS_MAX = 2000       # R-07：completed_transfers 上限（FIFO 淘汰），防内存无限增长
 MAX_MESSAGES = 200
 # 速率限制
 _rate_limits = {}  # {ip: [timestamps]} 滑动窗口
@@ -3212,7 +3213,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             # 身份绑定：客户端传入 persistent_id 做身份 key
             client_ip = self.client_address[0]
-            pid = params.get("pid", [""])[0]
+            # R-08：pid 直接作为 identity_map 的持久化 key，限制长度避免 JSON 文件膨胀
+            pid = params.get("pid", [""])[0][:128]
             my_name = params.get("my_name", [""])[0].strip()[:20]
 
             if pid:
@@ -3676,6 +3678,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     chunk_transfers.pop(transfer_id, None)
                     # Stage F (F4): 缓存完成状态，幂等接收重发请求
                     completed_transfers[transfer_id] = msg_id
+                    # R-07：超过上限时淘汰最旧条目（dict 保序，FIFO），防内存无限增长
+                    if len(completed_transfers) > COMPLETED_TRANSFERS_MAX:
+                        completed_transfers.pop(next(iter(completed_transfers)), None)
                     # Stage F (F3): 扣减 in-flight
                     with _inflight_lock:
                         _inflight_bytes = max(0, _inflight_bytes - ct.get("bytes_received", 0))
