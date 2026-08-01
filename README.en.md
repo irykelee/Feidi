@@ -43,7 +43,7 @@ python3 transfer.py
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--port PORT` | HTTP service port | `9876` |
+| `--port PORT` | HTTP service port | `18080` |
 | `--pass PASSWORD`, `--password PASSWORD` | Access password (both flags accepted) | _(none — no auth required)_ |
 | `--bind HOST` | Bind address (LAN IP only by default; use `0.0.0.0` to listen on all interfaces) | LAN-detected IP |
 | `--no-browser` | Don't auto-open the browser | `false` |
@@ -63,7 +63,7 @@ You can also set the password via the `FEIDI_PASSWORD` environment variable.
 1. Confirm phone and PC are on the same Wi-Fi network
 2. Windows Firewall may be blocking inbound — either:
    - Double-click `allow_firewall.bat` (requires admin)
-   - Or run manually: `netsh advfirewall firewall add rule name="Feidi" dir=in action=allow protocol=TCP localport=9876`
+   - Or run manually: `netsh advfirewall firewall add rule name="Feidi" dir=in action=allow protocol=TCP localport=18080`
 
 ## Project Structure
 

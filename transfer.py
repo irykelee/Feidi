@@ -97,7 +97,7 @@ def generate_qr_svg(data, module_px=4, border=4):
 
 # --- 命令行参数 ---
 parser = argparse.ArgumentParser(description="飞递 Feidi — 局域网传输工具")
-parser.add_argument("--port", type=int, default=9876, help="HTTP 服务端口 (默认 9876)")
+parser.add_argument("--port", type=int, default=18080, help="HTTP 服务端口 (默认 18080)")
 parser.add_argument("--pass", "--password", dest="password", type=str, default="", help="访问密码，为空则不设密码")
 parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
 # Stage G (M4): 自定义绑定地址（默认仅绑定探测到的 LAN IP，避免 0.0.0.0 暴露）

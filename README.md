@@ -43,7 +43,7 @@ python3 transfer.py
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--port PORT` | HTTP 服务端口 | `9876` |
+| `--port PORT` | HTTP 服务端口 | `18080` |
 | `--password PASSWORD` | 访问密码 | 无 |
 | `--no-browser` | 不自动打开浏览器 | `false` |
 
@@ -62,7 +62,7 @@ python3 transfer.py
 1. 确认手机和电脑在同一 Wi-Fi
 2. Windows 防火墙可能拦截：
    - 双击 `allow_firewall.bat`（需管理员权限）
-   - 或手动执行：`netsh advfirewall firewall add rule name="Feidi" dir=in action=allow protocol=TCP localport=9876`
+   - 或手动执行：`netsh advfirewall firewall add rule name="Feidi" dir=in action=allow protocol=TCP localport=18080`
 
 ## 项目结构
 

@@ -29,12 +29,12 @@ echo.
 netsh advfirewall firewall delete rule name="SimpleTransfer_HTTP" >nul 2>&1
 netsh advfirewall firewall delete rule name="Feidi_HTTP" >nul 2>&1
 
-:: 添加新规则：允许 TCP 9876 端口入站
-netsh advfirewall firewall add rule name="Feidi_HTTP" dir=in action=allow protocol=TCP localport=9876
+:: 添加新规则：允许 TCP 18080 端口入站
+netsh advfirewall firewall add rule name="Feidi_HTTP" dir=in action=allow protocol=TCP localport=18080
 
 if %errorlevel% equ 0 (
     echo.
-    echo [成功] 防火墙规则已添加！端口 9876 已放行。
+    echo [成功] 防火墙规则已添加！端口 18080 已放行。
     echo.
     echo 现在请重新启动 start.bat，然后用手机访问。
 ) else (
