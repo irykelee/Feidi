@@ -71,6 +71,17 @@ echo "[B] Commit hygiene"
 check "Working tree clean" "git diff --quiet HEAD"
 check "Pre-commit hook configured" "test -f ~/.claude/bin/git-hooks/pre-commit || test -f /Users/iryke/bin/git-hooks/pre-commit || git config --get core.hooksPath"
 
+# --- C. Regression tests ---
+echo ""
+echo "[C] Regression tests"
+if bash tests/run_tests.sh; then
+    echo -e "${GREEN}✓${NC} Regression tests pass (identities auto-restored)"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Regression tests failed (see output above)"
+    FAIL=$((FAIL + 1))
+fi
+
 # --- D. Release assets ---
 echo ""
 echo "[D] Release assets (verify after build)"
