@@ -641,11 +641,36 @@ def check_rate_limit(client_ip):
         if len(_rate_limits[client_ip]) >= RATE_LIMIT:
             return False
         _rate_limits[client_ip].append(now)
-        # 定期清理超过 1 小时未活跃的 IP 条目
+        # 顺手清空 list 条目（如果所有时间戳都超过 RATE_WINDOW 已被
+        # 上面 filter 剔除）—— 这样新进来时的 stale 扫描可以正确处理。
         stale = [ip for ip, ts_list in _rate_limits.items() if not ts_list]
         for ip in stale:
             del _rate_limits[ip]
     return True
+
+
+# --- R-04: _rate_limits 容量治理 ---
+_MAX_RATE_LIMIT_KEYS = 10000   # 硬上限；超过时 LRU 淘汰
+_RATE_LIMITS_IDLE = 3600       # 1 小时未活跃即视为 stale，可在 periodic cleanup 删除
+
+
+def _rate_limits_cleanup():
+    """R-04：周期性清理超过 1 小时未活跃的 IP；若仍超过硬上限，按最旧淘汰。
+    由 ``_periodic_cleanup_loop`` 每 CLEANUP_INTERVAL 调用一次。
+    """
+    now = time.time()
+    with _rate_lock:
+        idle_cutoff = now - _RATE_LIMITS_IDLE
+        stale = [ip for ip, lst in _rate_limits.items()
+                 if not lst or lst[-1] < idle_cutoff]
+        for ip in stale:
+            _rate_limits.pop(ip, None)
+        if len(_rate_limits) > _MAX_RATE_LIMIT_KEYS:
+            ordered = sorted(_rate_limits.items(),
+                             key=lambda kv: kv[1][-1] if kv[1] else 0)
+            evict = len(_rate_limits) - _MAX_RATE_LIMIT_KEYS
+            for ip, _ in ordered[:evict]:
+                _rate_limits.pop(ip, None)
 
 
 def _is_device_online(device_id):
