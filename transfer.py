@@ -706,9 +706,8 @@ _LANG_DEFAULT = "zh"
 
 
 def _pick_lang(query_string=""):
-    import re as _re
     if query_string:
-        m = _re.search(r"(?:^|[&;])lang=([a-zA-Z-]+)", query_string)
+        m = re.search(r"(?:^|[&;])lang=([a-zA-Z-]+)", query_string)
         if m:
             v = m.group(1).lower().split("-")[0]
             if v in ("zh", "en"):
@@ -3895,7 +3894,7 @@ def main():
     print(f"  手机端:  {mobile_url}")
     if PASSWORD:
         print("  密码保护: 已启用（访问时需输入密码）")
-    print(f"  按 Ctrl+C 停止")
+    print("  按 Ctrl+C 停止")
     print("-" * 52)
     print("  \033[93m提示:\033[0m 手机扫码后若无法打开，请检查：")
     print("    1. 手机与电脑是否在同一 Wi-Fi")
