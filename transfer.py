@@ -3763,9 +3763,10 @@ def kill_old_instance(port):
                 comm = r2.stdout.strip().lower()
                 r3 = subprocess.run(["ps", "-p", pid, "-o", "command="], capture_output=True, text=True, timeout=3)
                 cmd = r3.stdout.strip().lower()
-                # 优先精确 argv0；comm 也可能截断，再看完整 command 是否包含 transfer.py / Feidi
+                # 仅精确匹配 comm / argv0 ∈ feidi_names（S-07：删除 "transfer.py" in cmd /
+                # "/feidi" in cmd 子串分支，避免误杀同机其他含该子串的 Python 进程）。
                 argv0 = cmd.split()[0] if cmd else ""
-                if comm in feidi_names or argv0 in feidi_names or "transfer.py" in cmd or "/feidi" in cmd:
+                if comm in feidi_names or argv0 in feidi_names:
                     try:
                         os.kill(int(pid), signal.SIGTERM)
                     except (ProcessLookupError, PermissionError) as e:
