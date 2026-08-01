@@ -2881,6 +2881,26 @@ MOBILE_HTML = (MOBILE_HTML
     .replace("__ICON_DOC__", SVG["doc"])
 )
 
+def _parse_content_length(headers, max_allowed=None):
+    """C-05：安全解析 Content-Length。
+
+    非法值（非数字 / 负数 / 超 max_allowed）返回 None，调用方应回 400。
+    缺失或空头视为 0（兼容不发送该头的客户端）。BaseHTTPRequestHandler 不会
+    解析该头，原始 socket 可发 'Content-Length: abc' 使 int() 抛 ValueError → 500，
+    故必须在此兜底。
+    """
+    raw = headers.get("Content-Length") or "0"
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return None
+    if val < 0:
+        return None
+    if max_allowed is not None and val > max_allowed:
+        return None
+    return val
+
+
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """支持多线程的 HTTP 服务器，每个请求在独立线程中处理。"""
     daemon_threads = True
@@ -3294,9 +3314,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 bucket.append(now)
                 _rate_limits[client_ip] = bucket
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > 1024:
-                self.send_error_body(413, "Request too large")
+            content_length = _parse_content_length(self.headers, max_allowed=1024)
+            if content_length is None:
+                # C-05：非法 Content-Length（如 'abc' / 负数 / 超限）直接 400，避免 int() 抛 500
+                self.send_error_body(400, "Invalid or missing Content-Length")
                 return
             body = self.rfile.read(content_length)
             try:
@@ -3304,7 +3325,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 self.send_error_body(400, "Invalid JSON")
                 return
-            if secrets.compare_digest(data.get("password", ""), PASSWORD):
+            if not isinstance(data, dict):
+                self.send_error_body(400, "Invalid JSON: expected object")
+                return
+            pw = data.get("password", "")
+            if not isinstance(pw, str):
+                # secrets.compare_digest raises TypeError on non-str;
+                # reject here with a 400 so callers don't see a 500.
+                self.send_error_body(400, "password must be a string")
+                return
+            if secrets.compare_digest(pw, PASSWORD):
                 self.set_auth_cookie()
                 self.send_json(200, {"ok": True})
             else:
@@ -3343,13 +3373,36 @@ class RequestHandler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 self.send_error_json(400, "Invalid JSON")
                 return
+            # C-03：JSON 顶层必须是 object（dict）。其它类型（旧 API
+            # 直发 [] 或裸字符串）现在统一返回 400，不再让
+            # data.get("...") 抛 AttributeError 杀掉连接。
+            if not isinstance(data, dict):
+                self.send_error_json(400, "Invalid JSON: expected object")
+                return
 
-            sender = data.get("sender", "")
-            if sender not in ALLOWED_SENDERS:
-                sender = "unknown"
-            dev_name = data.get("device_name", "")
-            dev_id = data.get("device_id", "")
+            # S-01 校验：body 中若包含身份字段，必须等于 session 派生值。
+            # 任一不一致立即 403，不进入业务分支。
+            for field, sess_key in (("device_id", "device_id"),
+                                    ("device_name", "name"),
+                                    ("sender", "type")):
+                provided = data.get(field)
+                if provided is None:
+                    continue
+                if provided != sess[sess_key]:
+                    self.send_error_json(
+                        403, f"{field} does not match session")
+                    return
+
+            # 全部身份字段使用 session 派生值；body 即使未提供也安全。
+            sender = sess["type"]
+            dev_name = sess["name"]
+            dev_id = sess["device_id"]
             target_id = data.get("target_id", None)  # None = 广播, str = 私聊目标
+            # C-03：target_id 必须是 str 或 null；数字/数组/list
+            # 都会在后续 _is_device_online(t) 抛 AttributeError。
+            if target_id is not None and not isinstance(target_id, str):
+                self.send_error_json(400, "target_id must be a string or null")
+                return
 
             # Stage C (C1 续): 私聊目标离线前置检查 — 避免消息 append 后才发现离线而残留
             if target_id and not _is_device_online(target_id):
@@ -3358,8 +3411,18 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             # --- 分块传输模式 ---
             if "chunk_index" in data and "total_chunks" in data and "transfer_id" in data:
-                chunk_index = int(data["chunk_index"])
-                total_chunks = int(data["total_chunks"])
+                # C-03：chunk_index 和 total_chunks 必须是整数；之前
+                # int("x") 直接抛 ValueError 让 handler 死掉、连接断。
+                try:
+                    chunk_index = int(data["chunk_index"])
+                    total_chunks = int(data["total_chunks"])
+                except (ValueError, TypeError):
+                    self.send_error_json(
+                        400, "chunk_index/total_chunks must be integers")
+                    return
+                if not isinstance(data["transfer_id"], str):
+                    self.send_error_json(400, "transfer_id must be a string")
+                    return
                 transfer_id = str(data["transfer_id"]).strip()
                 chunk_b64 = data.get("chunk_data", "")
 
@@ -3549,16 +3612,26 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             if "text" in data and data["text"]:
                 text = data["text"]
+                # C-03：text 必须为字符串；数字/列表会让 len() 抛 TypeError。
+                if not isinstance(text, str):
+                    self.send_error_json(400, "text must be a string")
+                    return
                 if len(text) > 10000:
                     self.send_error_json(413, "Text too long (max 10000 chars)")
                     return
                 msg_id, target_ok = add_message("text", text, sender, dev_name, dev_id, target_id)
             elif "image" in data and data["image"]:
                 img_data = data["image"]
+                # C-03：image 必须是字符串（data URI 形态）；数字/列表
+                # 都会让 add_message 内的 startswith/base64 抛异常。
+                if not isinstance(img_data, str):
+                    self.send_error_json(400, "image must be a string")
+                    return
                 if len(img_data) > 5 * 1024 * 1024:
                     self.send_error_json(413, "Image too large (max 5MB)")
                     return
-                if not img_data.startswith("data:image/"):
+                # C-08：data:image 前缀大小写不敏感（与 add_message 的 partition 宽松路径对齐）
+                if not img_data.lower().startswith("data:image/"):
                     self.send_error_json(400, "Only data:image/... URIs accepted")
                     return
                 msg_id, target_ok = add_message("image", img_data, sender, dev_name, dev_id, target_id)
