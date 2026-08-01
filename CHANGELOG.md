@@ -12,6 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.1] - 2026-08-01 — Code Review Follow-up / 代码审查跟进修复
+
+> **ZH** 基于 `docs/CODE_REVIEW_2026-08-01.md` 的复核，补齐此前"修了一半"或遗漏的 P1/P2 项。全部为纯后端/文档改动，无功能回退。
+>
+> **EN** Follow-up fixes from `docs/CODE_REVIEW_2026-08-01.md`, closing the partially-fixed / missed P1-P2 items. Backend + docs only, no behavior regression.
+
+### Fixed / 修复
+- **C-04** 分块上传 `file_info` 字段类型未校验：非 dict 或 `size` 非数字时统一返回 400，不再 500 断连。
+- **C-05** 非法 `Content-Length`（如 `abc`）导致 handler 抛 `ValueError → 500`；新增 `_parse_content_length` 兜底返回 400。
+- **C-06** `identity_map` 写路径（SSE 握手新增/更新、`/rename` 遍历）统一持 `_identity_lock`，消除并发 `RuntimeError` 与 JSON 写旧。
+- **C-07** 删除 `_pick_lang` 内多余的 `import re as _re`（顶层已 import）。
+- **C-08** `/send` 的 `data:image/` 前缀大小写不敏感，与 `add_message` 宽松路径对齐。
+- **S-07** `kill_old_instance` 删除 `"transfer.py" in cmd` / `"/feidi" in cmd` 子串匹配，仅精确匹配 `comm`/`argv0 ∈ feidi_names`，避免误杀同机其他 Python 进程。
+- **S-08** `_origin_allowed` 收紧为仅允许本机/局域网实际 host（由 `main()` 注入 `LOCAL_IP`/`BIND_HOST`/hostname），不再对任意合法 IP 反射 origin、跨域读 SSE。
+- **S-09** legacy `/send` 文件分支改为 base64 解码后按**实际字节数**限制 50MB，不再信任客户端声明 `size`。
+- **S-10** `get_local_ip` 默认监听候选仅限 RFC1918/loopback，无私网地址时回退 `127.0.0.1` 并警告，不再默认暴露公网。
+- **R-05** SSE 每连接事件队列设上限（`SSE_QUEUE_MAX=256`），慢消费堆积到上限即被剔除；同 `device_id` 重连置位旧连接 `cancel` 事件并关闭旧 `wfile`，旧 handler 线程可及时回收。
+- **R-06** 分块组装完成文件经 `src_path` 直接 move 到最终路径（`add_message` 支持），不再整块 `f.read()` 进内存（≤500MB 峰值从"内存 500MB + 多份磁盘"降为"磁盘一份副本"）。
+- **R-07** `completed_transfers` 增加 FIFO 上限（`COMPLETED_TRANSFERS_MAX=2000`），防内存无限增长。
+- **R-08** `/events?pid=` 长度上限 128，避免持久化 JSON 膨胀。
+- **L-02 / D-04** 关闭状态机补全：finally 中 `_server_stop_event.set()`（替换从未使用的 `_server_stopped` 死变量）；退出时取消 5s debounce timer 并同步 flush 身份文件，避免改名/新身份后 Ctrl+C 丢数据。
+- **D-05** `add_message` 文件 meta 改为先写完整 JSON 再 `flush`+`fsync`（旧实现顺序反了，崩溃窗口下 meta 为空/截断）。
+- **D-06** 版本号统一为 `1.1.0`；README 特性列表移除已废弃的 "SHA-256 Cookie 认证"；CHANGELOG 去重 `[1.1.0]` 标题；`start.bat` 三个 launcher 分支均透传 `%*`（CLI 参数不再被吞）。
+- **A-07** 可访问性：移动端 viewport 移除 `maximum-scale=1,user-scalable=no`（恢复缩放）；PC/手机登录遮罩加 `role="dialog"`/`aria-modal`/`aria-labelledby` 并在弹出时聚焦密码框；设备列表项加 `role="button"`/`tabindex="0"` 与 Enter/Space 键盘激活。
+- **Q-04** 去除两处无占位符 f-string（ruff F541）。
+
+
 ## [Unreleased]
 
 ### Added / 新增
@@ -38,8 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - release `89feefa` + `1f6c77e` 落地;`v1.1.0` 已发布 (8 个 audit-fix commit + 文档基础设施)
 
 ---
-
-## [1.1.0] - 2026-07-29 — Security & Reliability Audit Remediation / 安全与可靠性审计修复
 
 ## [1.1.0] - 2026-07-29 — Security & Reliability Audit Remediation / 安全与可靠性审计修复
 

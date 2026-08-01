@@ -10,13 +10,13 @@ echo  正在启动传输服务...
 echo.
 
 :: B12: 优先 py -3 强约束到 Python 3
-py -3 "%~dp0transfer.py"
+py -3 "%~dp0transfer.py" %*
 if %errorlevel% equ 0 goto :end
 
-python3 "%~dp0transfer.py"
+python3 "%~dp0transfer.py" %*
 if %errorlevel% equ 0 goto :end
 
-python "%~dp0transfer.py"
+python "%~dp0transfer.py" %*
 if %errorlevel% equ 0 goto :end
 
 echo.
