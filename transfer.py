@@ -118,6 +118,7 @@ socketserver.TCPServer.allow_reuse_address = True
 # --- 安全限制 ---
 MAX_BODY_SIZE = 100 * 1024 * 1024   # POST body 最大 100MB
 MAX_SSE_CLIENTS = 20                  # 最大并发 SSE 连接数
+SSE_QUEUE_MAX = 256                    # 每连接 SSE 事件队列上限（R-05：防慢消费无限堆积）
 ALLOWED_SENDERS = {"pc", "mobile"}    # 合法的发送者标识
 AUTH_TOKEN = secrets.token_hex(16) if PASSWORD else ""  # 用随机 token 代替密码明文
 LOCAL_IP = None  # 缓存，首次调用 get_local_ip() 后填充
@@ -3294,10 +3295,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
             with _sse_lock:
-                # 清除同 device_id 的旧连接（避免刷新/重连时设备列表出现重复）
+                # 清除同 device_id 的旧连接（避免刷新/重连时设备列表出现重复）；
+                # R-05：重连时置位旧连接的 cancel 事件并关闭其 wfile，旧 handler 线程
+                # 不再空转直到 TCP 断开，可及时回收。
                 for i in range(len(sse_clients) - 1, -1, -1):
                     if sse_clients[i].get("device_id") == device_id:
-                        sse_clients.pop(i)
+                        old = sse_clients.pop(i)
+                        old["cancel"].set()
+                        try:
+                            old["wfile"].close()
+                        except Exception:
+                            pass
                 sse_clients.append(dev_info)
             broadcast_device_list()
 
@@ -3316,17 +3324,20 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                while True:
+                while not dev_info["cancel"].is_set():
                     try:
                         data = dev_info["queue"].get(timeout=SSE_KEEPALIVE_TIMEOUT)
                         self.wfile.write(data.encode("utf-8"))
                         self.wfile.flush()
                     except queue.Empty:
+                        if dev_info["cancel"].is_set():
+                            break
                         self.wfile.write(": keepalive\n\n".encode("utf-8"))
                         self.wfile.flush()
             except Exception:
                 pass
             finally:
+                dev_info["cancel"].set()
                 with _sse_lock:
                     if dev_info in sse_clients:
                         sse_clients.remove(dev_info)
