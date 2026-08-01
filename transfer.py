@@ -3463,11 +3463,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                         if len(chunk_transfers) >= MAX_CONCURRENT_TRANSFERS:
                             self.send_error_json(503, "Too many concurrent transfers")
                             return
-                        ct_info = data.get("file_info") or {"name": "unknown", "size": 0, "mime": "application/octet-stream"}
+                        # C-04：file_info 必须是 dict；size 必须是数字（bool 是 int 子类，需排除）。
+                        # 畸形 body（file_info: "abc" 或 {"size": "abc"}）此前会让 ct_info.get() /
+                        # 比较抛 AttributeError/TypeError → 500 断连。
+                        ct_info = data.get("file_info")
+                        if not isinstance(ct_info, dict):
+                            ct_info = {"name": "unknown", "size": 0, "mime": "application/octet-stream"}
                         fsize = ct_info.get("size", 0)
+                        if isinstance(fsize, bool) or not isinstance(fsize, (int, float)):
+                            self.send_error_json(400, "file_info.size must be a number")
+                            return
                         if fsize > MAX_CHUNKED_FILE:
                             self.send_error_json(413, f"File too large (max {MAX_CHUNKED_FILE // (1024*1024)}MB)")
                             return
+                        # 防御性长度上限，避免超大 name/mime 撑爆持久化 JSON
+                        ct_info["name"] = str(ct_info.get("name", "unknown"))[:200]
+                        ct_info["mime"] = str(ct_info.get("mime", "application/octet-stream"))[:100]
                         if total_chunks > 10000:
                             self.send_error_json(400, "Too many chunks")
                             return
@@ -3640,10 +3651,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not isinstance(file_data, dict):
                     self.send_error_json(400, "Invalid file data")
                     return
-                fsize = file_data.get("size", 0)
-                if fsize > 50 * 1024 * 1024:
+                # S-09：不再信任客户端声明的 size。base64 解码后按实际字节数限 50MB，
+                # 否则可声明小 size 绕过门槛、实际存下约 75MB（受 100MB body 上限约束）。
+                fb64 = file_data.get("data", "")
+                try:
+                    fbin = base64.b64decode(fb64) if fb64 else b""
+                except Exception:
+                    self.send_error_json(400, "Invalid base64 in file data")
+                    return
+                if len(fbin) > 50 * 1024 * 1024:
                     self.send_error_json(413, "File too large (max 50MB)")
                     return
+                # 用实际解码字节数覆盖声明 size，并规范 name/mime 长度
+                file_data = dict(file_data)
+                file_data["size"] = len(fbin)
+                file_data["name"] = str(file_data.get("name", "unknown"))[:200]
+                file_data["mime"] = str(file_data.get("mime", "application/octet-stream"))[:100]
                 msg_id, target_ok = add_message("file", file_data, sender, dev_name, dev_id, target_id)
             else:
                 self.send_error_json(400, "No text, image or file")
