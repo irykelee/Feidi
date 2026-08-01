@@ -306,13 +306,21 @@ def _save_chunk_state(transfer_id):
 
 
 def _load_chunk_states():
-    """Stage F (F6): 启动时扫描 feidi_chunks/*.state.json 恢复 in-flight 传输。
-    7 天前的状态文件视为陈旧直接删除。"""
+    """启动时扫描 ``feidi_chunks/*.state.json`` 恢复 in-flight 传输。
+
+    C-01 修复：函数内同时读+写模块级 ``_inflight_bytes``，必须声明 global
+    否则 Python 视为新局部变量，第一次访问就抛 UnboundLocalError。
+
+    C-02 修复：加载前先校验磁盘上每个声明 chunk_index 都有对应 ``.chunk``
+    文件。任一缺失即视为不可恢复：删除 entry、目录和 state，避免"内存说有
+    / 磁盘没有"的伪恢复。返回实际保留（state 与磁盘一致）的 tids。
+    """
+    global _inflight_bytes
     if not os.path.isdir(CHUNK_DIR):
-        return
+        return []
     now = time.time()
     seven_days = 7 * 86400
-    loaded = 0
+    valid_tids: list[str] = []
     for name in os.listdir(CHUNK_DIR):
         if not name.endswith(".state.json"):
             continue
@@ -329,6 +337,26 @@ def _load_chunk_states():
             chunks = set(state.get("chunks", []))
             total = int(state.get("total", 0))
             if not chunks or total <= 0:
+                # 空 state：仅删 state 文件，目录留给 _startup_cleanup
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            # C-02 校验：所有声明的 chunk 文件都必须存在于磁盘上。
+            # 任何缺失都视为不可恢复；清掉 state + 整个 transfer 目录，
+            # 避免 _startup_cleanup 后内存中残留"已收到"的虚假状态。
+            transfer_dir = os.path.join(CHUNK_DIR, tid)
+            missing = [
+                i for i in chunks
+                if not os.path.isfile(os.path.join(transfer_dir, f"{i}.chunk"))
+            ]
+            if missing:
+                shutil.rmtree(transfer_dir, ignore_errors=True)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
                 continue
             with _chunk_lock:
                 chunk_transfers[tid] = {
@@ -348,21 +376,26 @@ def _load_chunk_states():
                 # 计入 in-flight 配额
                 with _inflight_lock:
                     _inflight_bytes += chunk_transfers[tid]["bytes_received"]
-            loaded += 1
+            valid_tids.append(tid)
         except (OSError, ValueError, json.JSONDecodeError):
             # 损坏的状态文件直接删
             try:
                 os.remove(path)
             except OSError:
                 pass
-    if loaded:
-        print(f"[feidi] recovered {loaded} chunk transfer(s) from disk", flush=True)
+    if valid_tids:
+        print(f"[feidi] recovered {len(valid_tids)} chunk transfer(s) from disk", flush=True)
+    return valid_tids
 
 
 def _cleanup_stale_chunks(force=False):
     """清理过期分块（默认超过 STALE_CHUNK_TIMEOUT 秒未活动的清理）。force=True 时不发通知（用于退出清理）。
     Stage F (F2): 持 _chunk_lock，基于 last_activity 而非 created。
-    Stage F (F3): 清理时同步扣减全局 in-flight 字节。"""
+    Stage F (F3): 清理时同步扣减全局 in-flight 字节。
+
+    C-01 修复：见 ``_load_chunk_states`` 顶部说明。
+    """
+    global _inflight_bytes
     now = time.time()
     timeout = 0 if force else STALE_CHUNK_TIMEOUT
     dead = []
@@ -379,8 +412,14 @@ def _cleanup_stale_chunks(force=False):
                 _inflight_bytes = max(0, _inflight_bytes - ct.get("bytes_received", 0))
     for tid, ct in dead:
         cp = os.path.join(CHUNK_DIR, tid)
+        # C-02 修复：即使 force=True（atexit 路径），只要磁盘上还存在
+        # 对应的 ``<tid>.state.json``，就保留 ``.chunk`` 文件供下次启动
+        # 通过 ``_load_chunk_states`` 校验并接续。无 state 的孤儿目录照删。
         if os.path.isdir(cp):
-            shutil.rmtree(cp, ignore_errors=True)
+            if force and os.path.isfile(cp + ".state.json"):
+                pass
+            else:
+                shutil.rmtree(cp, ignore_errors=True)
         # 超时通知发送者和接收者
         if not force:
             fname = ct.get("info", {}).get("name", "未知文件") if isinstance(ct.get("info"), dict) else "未知文件"
@@ -413,16 +452,26 @@ def _cleanup_old_temp_files():
 
 
 def _startup_cleanup():
-    """启动时清理上次运行残留的分块目录（仅清 *目录*；state.json 文件由 _load_chunk_states 处理）。"""
-    if os.path.isdir(CHUNK_DIR):
-        for d in os.listdir(CHUNK_DIR):
-            dp = os.path.join(CHUNK_DIR, d)
-            # state.json 文件留给 _load_chunk_states 处理；只删目录残留
-            if os.path.isdir(dp):
-                try:
-                    shutil.rmtree(dp, ignore_errors=True)
-                except OSError:
-                    pass
+    """启动时清孤儿（无对应 ``.state.json`` 的残留 transfer 目录）。
+
+    C-02 修复：跳过有同名 ``<tid>.state.json`` 的目录——它们由
+    ``_load_chunk_states`` 校验后保留；只有真正孤儿才删。``state.json``
+    文件本身不被这里删除，留给 ``_load_chunk_states`` 决定保留或丢弃。
+    """
+    if not os.path.isdir(CHUNK_DIR):
+        return
+    for d in os.listdir(CHUNK_DIR):
+        if d.endswith(".state.json"):
+            continue
+        if os.path.isfile(os.path.join(CHUNK_DIR, d + ".state.json")):
+            # 有 state 文件陪着 → 留给 _load_chunk_states 决定
+            continue
+        dp = os.path.join(CHUNK_DIR, d)
+        if os.path.isdir(dp):
+            try:
+                shutil.rmtree(dp, ignore_errors=True)
+            except OSError:
+                pass
 
 
 def _periodic_cleanup_loop():
@@ -3207,6 +3256,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_error_body(404, "Not Found")
 
     def do_POST(self):
+        # C-01 修复：do_POST 内多处读+写模块级 ``_inflight_bytes``，需声明 global。
+        global _inflight_bytes
         parsed = urlparse(self.path)
         path = parsed.path
 
