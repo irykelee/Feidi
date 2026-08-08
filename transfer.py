@@ -269,8 +269,18 @@ def get_mac(ip):
 load_identities()
 
 
+# H1: cleanup() 在 signal_handler 与 atexit.register(cleanup) 两条路径都会触发
+# (sys.exit(0) 走 atexit)，需 idempotent guard 防止 _cleanup_stale_chunks(force=True)
+# 与 shutil.rmtree 在无锁下被并发重入。
+_cleanup_done = False
+
+
 def cleanup():
-    """退出时清理临时文件"""
+    """退出时清理临时文件（idempotent — signal_handler 与 atexit 都会触发；H1）"""
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
     _cleanup_stale_chunks(force=True)
