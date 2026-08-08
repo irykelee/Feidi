@@ -3880,18 +3880,29 @@ def kill_old_instance(port):
     feidi_names = {"feidi.exe", "feidi-macos", "feidi", "transfer.exe", "transfer.py"}
     try:
         if sys.platform == "win32":
+            # M6: 隐藏 subprocess 弹出的黑色窗口 (STARTUPINFO + STARTF_USESHOWWINDOW)
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = subprocess.SW_HIDE
             # Windows: netstat + tasklist（按 ImageName 精确匹配）
-            r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=5,
+                               startupinfo=_si)
             for line in r.stdout.splitlines():
                 if f":{port}" in line and "LISTENING" in line:
                     parts = line.strip().split()
                     pid = parts[-1]
                     r2 = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                                        capture_output=True, text=True, timeout=5)
+                                        capture_output=True, text=True, timeout=5,
+                                        startupinfo=_si)
                     first_line = (r2.stdout.splitlines() or [""])[0]
                     image = first_line.split(",", 1)[0].strip().strip('"').lower()
                     if image in feidi_names:
-                        subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, timeout=5)
+                        # M8: 先 /PID (无 /F) 发优雅退出信号, 兜底再 /F 强杀
+                        subprocess.run(["taskkill", "/PID", pid], capture_output=True, timeout=5,
+                                       startupinfo=_si)
+                        time.sleep(POST_KILL_GRACE)
+                        subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, timeout=5,
+                                       startupinfo=_si)
                         print(f"  \033[90m已终止旧的飞递进程 (PID: {pid}, {image})\033[0m")
                         time.sleep(POST_KILL_GRACE)
                         return True
