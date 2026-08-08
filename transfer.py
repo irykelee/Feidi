@@ -177,6 +177,9 @@ _server_hostname = socket.gethostname()
 # S-08：允许的 CORS Origin 主机集合（仅本机/局域网实际暴露的 host，避免对任意 IP 反射）。
 # main() 启动时填入 LOCAL_IP / BIND_HOST / hostname；默认仅 localhost。
 _allowed_origin_hosts = {"127.0.0.1", "localhost", "::1"}
+# M1：白名单的 IPv4/IPv6 解析结果，用于 _origin_allowed 的 IP 精确比对。
+# 字符串集合保留做日志/调试，运行时判断只依赖 _allowed_origin_ips。
+_allowed_origin_ips = set()
 
 
 def load_identities():
@@ -3831,13 +3834,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _origin_allowed(origin: str) -> bool:
-        """仅允许本机/局域网实际 host 的 Origin，跨域一律拒绝（S-08 收紧）。
-
-        旧实现 ipaddress.ip_address(host) 成功即返回 True —— 任意合法 IP（其他 LAN
-        主机、公网 IP）托管的网页都能拿到 Access-Control-Allow-Origin 反射，并可跨域
-        读取 /events SSE。现在只允许 _allowed_origin_hosts 中的主机（由 main() 在
-        启动时填入 LOCAL_IP / BIND_HOST / hostname + localhost）。
-        """
+        """M1/S-08：基于 IP 精确匹配（防 LAN 内 DNS 欺骗 → 攻击者 Origin 头部为
+        受害 PC LAN IP 字符串绕过白名单反射）。把 origin hostname 解析为 IP，
+        仅当该 IP ∈ _allowed_origin_ips 时放行。"""
         if not origin:
             return False
         try:
@@ -3846,7 +3845,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False
         if not host:
             return False
-        return host in _allowed_origin_hosts
+        try:
+            origin_ip = ipaddress.ip_address(socket.gethostbyname(host))
+        except (OSError, ValueError):
+            return False
+        return origin_ip in _allowed_origin_ips
 
 
 def kill_old_instance(port):
@@ -3898,16 +3901,25 @@ def kill_old_instance(port):
 
 
 def main():
-    global _allowed_origin_hosts
+    global _allowed_origin_hosts, _allowed_origin_ips
     local_ip = get_local_ip()
     # S-08：把本机实际暴露的 host 加入 CORS 允许列表（网页客户端同源 Origin 才被反射）
     _allowed_origin_hosts = {"127.0.0.1", "localhost", "::1", local_ip}
+    # M1：把白名单字符串预解析为 IP，_origin_allowed 做 IP 精确比对
+    # （删除 socket.gethostname() 加入 — 容器/多网卡下 hostname 不可解析，
+    #  会引入虚假信任，且与 IP 解析路径不兼容）
+    _allowed_origin_ips = set()
+    for h in _allowed_origin_hosts:
+        try:
+            _allowed_origin_ips.add(ipaddress.ip_address(h))
+        except ValueError:
+            pass  # "localhost" 等非 IP 字串跳过
     if BIND_HOST:
         _allowed_origin_hosts.add(BIND_HOST)
-    try:
-        _allowed_origin_hosts.add(socket.gethostname())
-    except Exception:
-        pass
+        try:
+            _allowed_origin_ips.add(ipaddress.ip_address(BIND_HOST))
+        except ValueError:
+            pass
     url = f"http://{local_ip}:{PORT}"
     mobile_url = url + "/mobile"
     if PASSWORD:
