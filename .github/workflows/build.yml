@@ -15,15 +15,15 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2 (H2)
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0 (H2)
         with:
           python-version: "3.13"
       - run: pip install -r requirements-build.txt
       # H-8: 用 spec 打包，spec 已包含 qrcode_lib datas + hidden imports
       - run: pyinstaller --noconfirm --clean build.spec
       - name: 上传到 Actions（actions/upload-artifact 会把 .exe 标记为可执行）
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3 (H2)
         with:
           name: Feidi-win
           path: dist/Feidi.exe
@@ -33,8 +33,8 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2 (H2)
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0 (H2)
         with:
           python-version: "3.13"
       - run: pip install -r requirements-build.txt
@@ -44,7 +44,7 @@ jobs:
       - name: 打包成 .app.zip
         run: |
           ditto -c -k --sequesterRsrc --keepParent dist/Feidi.app dist/Feidi-macos.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3 (H2)
         with:
           name: Feidi-macos
           path: dist/Feidi-macos.zip
@@ -56,10 +56,10 @@ jobs:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8 (H2)
         with:
           name: Feidi-win
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8 (H2)
         with:
           name: Feidi-macos
       # B7: 生成 SHA256SUMS 与产物同发
@@ -79,7 +79,7 @@ jobs:
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
             echo "title=Nightly build ${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           fi
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@e5f48c3b7b613b7a911e58a617b757074c4c790d  # v2.0.2 (H2)
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: ${{ steps.tag.outputs.title }}
