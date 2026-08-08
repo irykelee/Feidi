@@ -3027,6 +3027,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         except Exception:
             print(f"[feidi] {format}", file=sys.stderr, flush=True)
 
+    def end_headers(self):
+        # M15：覆盖 BaseHTTPRequestHandler.end_headers() 统一追加安全响应头，
+        # 所有 send_html/send_json/send_error_*/SSE/文件下载 50+ 站点零改动即生效
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        super().end_headers()
+
     def check_password(self):
         """检查密码 — 通过 Cookie 中的 auth token"""
         if not PASSWORD:
