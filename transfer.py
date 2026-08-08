@@ -181,6 +181,9 @@ _allowed_origin_hosts = {"127.0.0.1", "localhost", "::1"}
 # M1：白名单的 IPv4/IPv6 解析结果，用于 _origin_allowed 的 IP 精确比对。
 # 字符串集合保留做日志/调试，运行时判断只依赖 _allowed_origin_ips。
 _allowed_origin_ips = set()
+# M5: QR SVG 启动期预生成，handler 直接复用，URL 在 main() 启动后固定
+_MOBILE_QR_SVG = ""
+_MOBILE_QR_SVG_AUTH = ""
 
 
 def load_identities():
@@ -3114,7 +3117,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             mobile_url = f"http://{ip}:{PORT}/mobile"
             if PASSWORD:
                 mobile_url += "?auth=required"
-            qr_svg = generate_qr_svg(mobile_url)
+            # M5: 用 main() 启动期预生成的 QR SVG, 不再每请求重算
+            qr_svg = _MOBILE_QR_SVG_AUTH if PASSWORD else _MOBILE_QR_SVG
             # Stage i18n: 服务器探测语言,设入 <html lang> 属性供 JS 读取
             lang = _pick_lang(parsed.query)
             html_content = (PC_HTML
@@ -3943,6 +3947,12 @@ def main():
     mobile_url = url + "/mobile"
     if PASSWORD:
         mobile_url += "?auth=required"
+
+    # M5: QR SVG 启动期预生成, handler 直接用模块常量, 不再每请求重算
+    # (URL 在启动后固定, 唯一变量是 PASSWORD 开关, 故缓存两个变体)
+    global _MOBILE_QR_SVG, _MOBILE_QR_SVG_AUTH
+    _MOBILE_QR_SVG = generate_qr_svg(mobile_url.replace("?auth=required", ""))
+    _MOBILE_QR_SVG_AUTH = generate_qr_svg(mobile_url)
 
     print("-" * 52)
     print("  飞递 Feidi - 局域网传输工具")
