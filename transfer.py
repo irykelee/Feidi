@@ -603,6 +603,21 @@ def get_local_ip():
 # entry_paths 在第一次 acquire 时从 MSG_FILES 快照，淘汰可能摘 MSG_FILES 但不会
 # 影响 entry_paths。_release_file 在 ref==0 时按 entry_paths 真删盘。
 # 所有读写都在 _file_ref_lock 下。
+
+
+def _delete_entry_paths(entry):
+    """M13: 抽取 _release_file 与 _cleanup_msg_files 共用的文件删除逻辑。
+    best-effort 但不静默——磁盘满/权限漂移需要能看见。"""
+    if not entry:
+        return
+    for p in entry:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError as e:
+            print(f"[feidi] _delete_entry_paths: cleanup failed: {p}: {e}", flush=True)
+
+
 def _acquire_file(msg_id):
     """下载入口：ref+1，返回 entry 路径元组。已被淘汰/未注册返回 None。
        M-1: 直接返回快照的 entry，handler 无需再读 MSG_FILES，关闭 TOCTOU 窗口。"""
@@ -634,14 +649,8 @@ def _release_file(msg_id):
         # Stage D (C2): 与 _cleanup_msg_files 对称 — 下载结束后同步摘 MSG_FILES，
         # 否则后续 _acquire_file 仍会返回这个 msg_id 但路径已删，导致 404 之前打开 0 字节。
         MSG_FILES.pop(msg_id, None)
-        if entry:
-            for p in entry:
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except OSError as e:
-                    # M-2: best-effort 但不静默——磁盘满/权限漂移需要能看见
-                    print(f"[feidi] _release_file: cleanup failed: {p}: {e}", flush=True)
+        # M13: 用共享 helper, 避免与 _cleanup_msg_files 重复逻辑
+        _delete_entry_paths(entry)
 
 
 def _cleanup_msg_files(msg_id):
@@ -656,14 +665,8 @@ def _cleanup_msg_files(msg_id):
         # 无引用，直接摘 + 删
         _file_refs.pop(msg_id, None)
         entry = MSG_FILES.pop(msg_id, None)
-        if entry:
-            for p in entry:
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except OSError as e:
-                    # M-2: best-effort 但不静默——磁盘满/权限漂移需要能看见
-                    print(f"[feidi] _cleanup_msg_files: cleanup failed: {p}: {e}", flush=True)
+        # M13: 用共享 helper, 避免与 _release_file 重复逻辑
+        _delete_entry_paths(entry)
 
 
 def check_rate_limit(client_ip, session_token=""):
