@@ -31,7 +31,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 # --- QR 码生成（基于 qrcode 库，纯 Python） ---
 

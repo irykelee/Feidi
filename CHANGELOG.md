@@ -12,6 +12,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.2] - 2026-08-08 — Audit Remediation Round 2 / 第二轮审计修复
+
+> **ZH** 对照 `docs/CODE_REVIEW_2026-08-01.md` 与 `docs/CODE_REVIEW_2026-07-30.md` 复核后，第二轮全量审计发现 33 项潜在缺陷（高 3 / 中 15 / 低 15），本版本落地 20 个原子 commit 关闭 31 项，2 项明确跳过（M14 需 Developer ID，单开 sprint）。CI 双跑绿（commit `cd0caf3..8839faf` + chore `46d1bb6`），26/26 unittest 全部通过。
+>
+> **EN** Round 2 of the comprehensive audit (refs `docs/CODE_REVIEW_2026-08-01.md` / `docs/CODE_REVIEW_2026-07-30.md`) identified 33 findings (H 3 / M 15 / L 15). This release lands 20 atomic commits closing 31 items; 2 deferred (M14 needs Developer ID, separate sprint). CI green twice (commits `cd0caf3..8839faf` + chore `46d1bb6`), 26/26 unittest pass.
+
+### Security / 安全
+- **H1** `cleanup()` 加 idempotent guard flag — `signal_handler` 与 `atexit.register(cleanup)` 两条退出路径重复调用 `_cleanup_stale_chunks(force=True)` 的竞态已消除。
+- **H2** 所有 GitHub Actions 改为 commit SHA pinned（5 个 action 共 9 处：checkout / setup-python / upload-artifact / download-artifact / softprops/action-gh-release），消除上游 action 仓库被劫持时 major tag 被指向恶意版本的风险。
+- **H3** `qrcode_lib/LICENSE`（BSD-3-Clause from Lincoln Loop）+ `qrcode_lib/VERSION=7.4.2` — vendored python-qrcode 的版权声明与版本溯源补齐。
+- **M1** `_origin_allowed` 改为把 origin hostname 解析为 IP 后与 `_allowed_origin_ips` 精确比对；删除 `socket.gethostname()` 加入（容器内不可解析，引入虚假信任）。
+- **M15** 覆盖 `BaseHTTPRequestHandler.end_headers()` 统一追加 `X-Content-Type-Options: nosniff` / `X-Frame-Options: DENY` / `Referrer-Policy: strict-origin-when-cross-origin`，50+ 响应站点零改动即生效。
+- **M4** 速率限制 key 从 `client_ip` 改为 `(client_ip, session_token[:32])`，同 NAT 多设备不再共享 5 req/s 配额；`/login` 保留 IP-only 兼容。
+
+### Reliability / 可靠性
+- **M2** `completed_transfers` 在 `_periodic_cleanup_loop` 中定期 FIFO 淘汰，长期 idle server 不再内存驻留。
+- **M5** QR SVG 在 `main()` 启动期预生成（auth / no-auth 两个变体），`/pc` 不再每次 GET 重算。
+- **M6** Windows 上 `kill_old_instance` 的 `netstat` / `tasklist` / `taskkill` subprocess 全部传 `startupinfo=STARTUPINFO() + STARTF_USESHOWWINDOW | SW_HIDE`，不再弹黑色控制台窗口。
+- **M8** `taskkill` 改为先 `/PID`（无 `/F`）发优雅退出信号 → 等 `POST_KILL_GRACE` → 兜底 `/F` 强杀，旧实例有机会执行 `_flush_identities_on_exit`（含在 M6 commit `372f9cb`）。
+- **M13** 提取 `_delete_entry_paths` helper，`_release_file` 与 `_cleanup_msg_files` 共用文件删除逻辑，错误日志统一前缀。
+- **M3** `_rate_limits` 改 `OrderedDict` + `move_to_end` / `popitem(last=False)`，`_rate_limits_cleanup` 从 O(n log n) `sorted()` 优化为 O(1) LRU 淘汰。
+- **M11** 删除 4 个 obsolete `tests/repro_*.py` 调试脚本（功能已迁入正式 `test_*.py` unittest 套件）。
+- **M7** SSE keepalive 从 comment 格式（`: keepalive\n\n`）改为标准 `event: ping\ndata: <ts>\n\n`，避免部分代理 / 客户端库把 comment 当作"无效数据"断开。
+
+### Documentation / 文档
+- **L1** 中英文 `README.md` 各加一行 `> **Python 3.10+ required**`，明确 PEP 604 union 语法的版本基线。
+- **L3** `_sse_lock` 重命名为 `_clients_lock`（全文件 11 处）— 实际保护 `sse_clients` 列表 + 全部广播/客户端操作，名字低估范围易让维护者误判临界区。
+- **L12** `_save_identities_flush` docstring 补充说明 snapshot-then-write 模式的设计权衡（性能 vs 实时一致性），崩溃窗口期 ≤ debounce 间隔。
+- **L14** `sender_name` fallback 由 `"pc"`/`"mobile"`（sender type）改为 `"未知设备"`，与现有 `未知文件` 命名风格一致。
+- **chore(gitignore)** `.workbuddy/` 加入 `.gitignore` — Claude Code agent 记忆目录绝对不能进仓库；同时保留会话前的 `feidi_chunks.*/` 与 `tests/_logs/` 排除（commit `46d1bb6`，与 release scope 隔离）。
+
+### Tests / 测试
+- **L11** `tests/run_tests.sh` 的 `trap cleanup EXIT` 扩展为 `EXIT INT TERM`，`Ctrl+C` / SIGTERM 中断时备份仍能恢复。
+
+### Deferred / 推迟
+- **M14** macOS `Feidi.app` 代码签名 + notarize — 需申请 Apple Developer ID，单开 sprint。
+- **M9 / M10 / M12** 与审计结论"可接受"的 **L2 / L4 / L8 / L9 / L10 / L13 / L15** 共 7 项 — 不进 v1.1.2。
+
+
 ## [1.1.1] - 2026-08-01 — Code Review Follow-up / 代码审查跟进修复
 
 > **ZH** 基于 `docs/CODE_REVIEW_2026-08-01.md` 的复核，补齐此前"修了一半"或遗漏的 P1/P2 项。全部为纯后端/文档改动，无功能回退。
