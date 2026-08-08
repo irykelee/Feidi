@@ -503,6 +503,8 @@ def _periodic_cleanup_loop():
         _cleanup_stale_chunks()
         # R-04：定期清理过期的 rate-limit 条目；防止字典随时间无限增长。
         _rate_limits_cleanup()
+        # M2：周期性 FIFO 淘汰 completed_transfers（防长期 idle 内存驻留）
+        _completed_transfers_cleanup()
 
 
 def _flush_identities_on_exit():
@@ -700,6 +702,14 @@ def _rate_limits_cleanup():
             evict = len(_rate_limits) - _MAX_RATE_LIMIT_KEYS
             for ip, _ in ordered[:evict]:
                 _rate_limits.pop(ip, None)
+
+
+def _completed_transfers_cleanup():
+    """M2：periodic 路径也跑一次 FIFO 上限检查, 防止 server 长期 idle 时
+    completed_transfers 内存驻留 (新完成路径已有此检查, 见 R-07)。"""
+    with _chunk_lock:
+        while len(completed_transfers) > COMPLETED_TRANSFERS_MAX:
+            completed_transfers.pop(next(iter(completed_transfers)), None)
 
 
 def _is_device_online(device_id):
