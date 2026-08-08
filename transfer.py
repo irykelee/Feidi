@@ -801,7 +801,7 @@ def add_message(msg_type, data, sender, device_name="", device_id="", target_id=
         "id": msg_id,
         "type": msg_type,
         "sender": sender,
-        "sender_name": device_name or sender,
+        "sender_name": device_name or "未知设备",
         "device_id": device_id,
         "time": int(time.time() * 1000),
     }
