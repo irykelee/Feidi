@@ -32,7 +32,7 @@ cleanup() {
     rm -f "$BAK"
   fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 # Make sure transfer.py is importable from the repo root.
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
