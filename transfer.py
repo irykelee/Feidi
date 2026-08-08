@@ -26,6 +26,7 @@ import tempfile
 import socketserver
 import hashlib
 import ipaddress
+from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
@@ -136,8 +137,8 @@ CHUNK_SIZE_LIMIT = 2 * 1024 * 1024  # 单块最大 2MB (base64 后 ~2.7MB JSON)
 MAX_CHUNKED_FILE = 500 * 1024 * 1024  # 最大 500MB
 COMPLETED_TRANSFERS_MAX = 2000       # R-07：completed_transfers 上限（FIFO 淘汰），防内存无限增长
 MAX_MESSAGES = 200
-# 速率限制
-_rate_limits = {}  # {ip: [timestamps]} 滑动窗口
+# 速率限制 — M3: OrderedDict 配合 move_to_end / popitem 实现 O(1) LRU
+_rate_limits = OrderedDict()  # {key: [timestamps]} 滑动窗口 + LRU
 _rate_lock = threading.Lock()
 RATE_LIMIT = 5     # 每秒最多 5 个请求
 RATE_WINDOW = 1.0
@@ -668,6 +669,7 @@ def check_rate_limit(client_ip):
     with _rate_lock:
         if client_ip not in _rate_limits:
             _rate_limits[client_ip] = []
+        _rate_limits.move_to_end(client_ip, last=False)  # M3: 标记最近访问 (LRU)
         _rate_limits[client_ip] = [t for t in _rate_limits[client_ip] if now - t < RATE_WINDOW]
         if len(_rate_limits[client_ip]) >= RATE_LIMIT:
             return False
@@ -686,8 +688,9 @@ _RATE_LIMITS_IDLE = 3600       # 1 小时未活跃即视为 stale，可在 perio
 
 
 def _rate_limits_cleanup():
-    """R-04：周期性清理超过 1 小时未活跃的 IP；若仍超过硬上限，按最旧淘汰。
+    """R-04 + M3：周期性清理超过 1 小时未活跃的 IP；若仍超过硬上限，按最旧淘汰。
     由 ``_periodic_cleanup_loop`` 每 CLEANUP_INTERVAL 调用一次。
+    M3：超限时 OrderedDict.popitem(last=False) O(1) LRU 淘汰, 取代旧 sorted()。
     """
     now = time.time()
     with _rate_lock:
@@ -696,12 +699,8 @@ def _rate_limits_cleanup():
                  if not lst or lst[-1] < idle_cutoff]
         for ip in stale:
             _rate_limits.pop(ip, None)
-        if len(_rate_limits) > _MAX_RATE_LIMIT_KEYS:
-            ordered = sorted(_rate_limits.items(),
-                             key=lambda kv: kv[1][-1] if kv[1] else 0)
-            evict = len(_rate_limits) - _MAX_RATE_LIMIT_KEYS
-            for ip, _ in ordered[:evict]:
-                _rate_limits.pop(ip, None)
+        while len(_rate_limits) > _MAX_RATE_LIMIT_KEYS:
+            _rate_limits.popitem(last=False)
 
 
 def _completed_transfers_cleanup():
