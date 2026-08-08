@@ -520,8 +520,9 @@ def _flush_identities_on_exit():
         _identities_save_timer = None
     try:
         _save_identities_flush()
-    except Exception:
-        pass
+    except Exception as e:
+        # L5: 不静默吞错, 磁盘满/权限问题用户需要能看见
+        print(f"[feidi] flush identities failed on exit: {e}", file=sys.stderr, flush=True)
 
 
 def signal_handler(sig, frame):
