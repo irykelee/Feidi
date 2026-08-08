@@ -324,8 +324,10 @@ def _save_chunk_state(transfer_id):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-    except OSError:
-        pass
+    except OSError as e:
+        # L6: 不静默吞错, 重启后断点续传状态丢失但客户端不知
+        print(f"[feidi] _save_chunk_state failed for {transfer_id}: {e}",
+              file=sys.stderr, flush=True)
 
 
 def _load_chunk_states():
