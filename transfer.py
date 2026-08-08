@@ -663,22 +663,23 @@ def _cleanup_msg_files(msg_id):
                     print(f"[feidi] _cleanup_msg_files: cleanup failed: {p}: {e}", flush=True)
 
 
-def check_rate_limit(client_ip):
-    """滑动窗口速率限制，返回 True 表示未超限"""
+def check_rate_limit(client_ip, session_token=""):
+    """M4：滑动窗口速率限制，key = (client_ip, session_token[:32])。
+    同 NAT 多设备各自独立配额；空 session_token 回退到仅按 IP (/login 用)。"""
+    key = (client_ip, (session_token or "")[:32])
     now = time.time()
     with _rate_lock:
-        if client_ip not in _rate_limits:
-            _rate_limits[client_ip] = []
-        _rate_limits.move_to_end(client_ip, last=False)  # M3: 标记最近访问 (LRU)
-        _rate_limits[client_ip] = [t for t in _rate_limits[client_ip] if now - t < RATE_WINDOW]
-        if len(_rate_limits[client_ip]) >= RATE_LIMIT:
+        if key not in _rate_limits:
+            _rate_limits[key] = []
+        _rate_limits.move_to_end(key, last=False)  # M3: 标记最近访问 (LRU)
+        _rate_limits[key] = [t for t in _rate_limits[key] if now - t < RATE_WINDOW]
+        if len(_rate_limits[key]) >= RATE_LIMIT:
             return False
-        _rate_limits[client_ip].append(now)
-        # 顺手清空 list 条目（如果所有时间戳都超过 RATE_WINDOW 已被
-        # 上面 filter 剔除）—— 这样新进来时的 stale 扫描可以正确处理。
-        stale = [ip for ip, ts_list in _rate_limits.items() if not ts_list]
-        for ip in stale:
-            del _rate_limits[ip]
+        _rate_limits[key].append(now)
+        # 顺手清空 list 条目
+        stale = [k for k, lst in _rate_limits.items() if not lst]
+        for k in stale:
+            del _rate_limits[k]
     return True
 
 
@@ -3498,9 +3499,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/send":
-            # 速率限制
+            # 速率限制 — M4: key 加入 session_token, 同 NAT 多设备各自独立配额
             client_ip = self.client_address[0]
-            if not check_rate_limit(client_ip):
+            session_token = self.headers.get("X-Feidi-Session", "")
+            if not check_rate_limit(client_ip, session_token=session_token):
                 self.send_error_json(429, "Too many requests")
                 return
 
