@@ -207,7 +207,15 @@ _identities_save_timer = None  # type: threading.Timer | None
 
 
 def _save_identities_flush():
-    """实际写盘内部函数; 调度由 save_identities() 负责。"""
+    """实际写盘内部函数; 调度由 save_identities() 负责。
+
+    L12 注释: snapshot-then-write 模式 — 先持 _identity_lock 拍
+    identity_map 快照, 再出锁做 I/O。这是性能权衡: 持锁期间不允许
+    任何 SSE handshake 并发写 (会卡 handshake), I/O 通常 < 100ms, 窗口期
+    一致性问题可接受。若 I/O 期间另一线程写入新身份, 该更新要等下次
+    debounce 触发才能落盘。崩溃时由 _flush_identities_on_exit
+    (signal_handler 路径) 兜底 flush, 丢数据窗口 ≤ debounce 间隔。
+    """
     global _identities_save_timer
     _identities_save_timer = None
     tmp = IDENTITY_FILE + ".tmp"
