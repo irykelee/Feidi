@@ -34,6 +34,8 @@
 
 ### 从源码运行
 
+> **Python 3.10+ required** — 代码使用 PEP 604 union 语法（如 `int | None`）。
+
 ```bash
 # 零依赖，直接启动
 python3 transfer.py

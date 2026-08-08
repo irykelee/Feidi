@@ -34,6 +34,8 @@ Double-click to run, scan the QR with your phone, you're connected.
 
 ### Run from source
 
+> **Python 3.10+ required** — code uses PEP 604 union syntax (e.g. `int | None`).
+
 ```bash
 # Zero deps — just start it
 python3 transfer.py
