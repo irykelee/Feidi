@@ -4,6 +4,13 @@ article_*.md
 # 运行时生成的文件
 feidi_identities.json
 feidi_chunks/
+feidi_chunks.*/   # test_c02 的临时快照目录（如 feidi_chunks.__test_snapshot__/）
+
+# 测试产物
+tests/_logs/
+
+# Claude Code agent 记忆目录（绝对不能进仓库）
+.workbuddy/
 
 # macOS
 .DS_Store
