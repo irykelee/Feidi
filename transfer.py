@@ -3452,7 +3452,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     except queue.Empty:
                         if dev_info["cancel"].is_set():
                             break
-                        self.wfile.write(": keepalive\n\n".encode("utf-8"))
+                        # M7: 标准 event:ping 格式, 部分代理 / 客户端库不解析
+                        # SSE comment (': keepalive\n\n'), 改用显式 event type
+                        self.wfile.write(f"event: ping\ndata: {int(time.time()*1000)}\n\n".encode("utf-8"))
                         self.wfile.flush()
             except Exception:
                 pass
