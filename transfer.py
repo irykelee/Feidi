@@ -142,9 +142,9 @@ _rate_limits = OrderedDict()  # {key: [timestamps]} 滑动窗口 + LRU
 _rate_lock = threading.Lock()
 RATE_LIMIT = 5     # 每秒最多 5 个请求
 RATE_WINDOW = 1.0
-# SSE 客户端列表: [{"queue": Queue, "device_id": str, "name": str, "type": str, "identity_key": str}, ...]
+# 在线客户端列表（每个元素含 queue / device_id / name / type / identity_key / session_token）— L3 重命名注释
 sse_clients = []
-_sse_lock = threading.Lock()
+_clients_lock = threading.Lock()
 _msg_lock = threading.Lock()
 # 分块传输: transfer_id -> {chunks: set, total: int, info: dict, created: timestamp, sender, device_name, device_id, target_id}
 chunk_transfers = {}
@@ -725,7 +725,7 @@ def _is_device_online(device_id):
     """Stage C：检查 SSE 客户端是否在线（私有 chat 离线目标前置检查，避免 ghost message 残留）。"""
     if not device_id:
         return False
-    with _sse_lock:
+    with _clients_lock:
         for c in sse_clients:
             if c.get("device_id") == device_id:
                 return True
@@ -751,7 +751,7 @@ def _check_session_token(token):
     """在 sse_clients 中按 token 反查 device_id。"""
     if not token:
         return None
-    with _sse_lock:
+    with _clients_lock:
         for c in sse_clients:
             if c.get("session_token") == token:
                 return c.get("device_id")
@@ -766,7 +766,7 @@ def _session_identity(token):
     返回值之前再校验一次，但 identity 字段不会再变。"""
     if not token:
         return None
-    with _sse_lock:
+    with _clients_lock:
         for c in sse_clients:
             if c.get("session_token") == token:
                 return {
@@ -904,7 +904,7 @@ def broadcast_sse(event, data, exclude_device=None, target_id=None):
         json_data = data
     else:
         json_data = json.dumps(data, ensure_ascii=False)
-    with _sse_lock:
+    with _clients_lock:
         for c in sse_clients:
             cid = c.get("device_id", "")
             if target_id:
@@ -925,7 +925,7 @@ def broadcast_sse(event, data, exclude_device=None, target_id=None):
 
 def broadcast_device_list():
     """广播当前连接的设备列表"""
-    with _sse_lock:
+    with _clients_lock:
         devices = [{"id": c["device_id"], "name": c["name"], "type": c["type"], "identity_key": c.get("identity_key", "")} for c in sse_clients]
         data = json.dumps({"devices": devices, "count": len(devices)}, ensure_ascii=False)
         dead = []
@@ -3169,7 +3169,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             # 通过 device_id 匹配（device_id 在 SSE 握手时分配，非公开）
             renamed = False
-            with _sse_lock:
+            with _clients_lock:
                 for c in sse_clients:
                     if c.get("device_id") == dev_id:
                         c["name"] = new_name
@@ -3289,7 +3289,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         elif path == "/events":
             # Stage G (M7): SSE 容量检查移入锁内，避免并发穿透
-            with _sse_lock:
+            with _clients_lock:
                 if len(sse_clients) >= MAX_SSE_CLIENTS:
                     self.send_error_body(503, "Too many connections")
                     return
@@ -3406,7 +3406,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.flush()
 
-            with _sse_lock:
+            with _clients_lock:
                 # 清除同 device_id 的旧连接（避免刷新/重连时设备列表出现重复）；
                 # R-05：重连时置位旧连接的 cancel 事件并关闭其 wfile，旧 handler 线程
                 # 不再空转直到 TCP 断开，可及时回收。
@@ -3429,7 +3429,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"event: history\ndata: {history}\n\n".encode("utf-8"))
                 self.wfile.flush()
             except Exception:
-                with _sse_lock:
+                with _clients_lock:
                     if dev_info in sse_clients:
                         sse_clients.remove(dev_info)
                 broadcast_device_list()
@@ -3450,7 +3450,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 pass
             finally:
                 dev_info["cancel"].set()
-                with _sse_lock:
+                with _clients_lock:
                     if dev_info in sse_clients:
                         sse_clients.remove(dev_info)
                 broadcast_device_list()
